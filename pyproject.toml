@@ -21,7 +21,16 @@ setuptools = "^80.9.0"
 lacosmic = "^1.4.0"
 h5py = "^3.11.0"
 psutil = "^6.0.0"
-# pyqt6 intentionally omitted: the QL GUI frontend is built separately.
+# GUI frontend deps are optional: `pip install -e .[gui]` (or `poetry install -E gui`).
+# Importing `llamas_ql` stays Qt-free; only `llamas_ql.QLook` needs these.
+PySide6 = { version = ">=6.6", optional = true }
+pyqtgraph = { version = ">=0.13", optional = true }
+
+[tool.poetry.extras]
+gui = ["PySide6", "pyqtgraph"]
+
+[tool.poetry.scripts]
+llamas-ql-gui = "llamas_ql.QLook.app:main"
 
 [build-system]
 requires = ["poetry-core"]

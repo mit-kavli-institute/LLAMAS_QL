@@ -1,0 +1,91 @@
+RED_IDXS = [1, 4, 7, 10, 13, 16, 19, 22]
+GREEN_IDXS = [2, 5, 8, 11, 14, 17, 20, 23]
+BLUE_IDXS = [3, 6, 9, 12, 15, 18, 21, 24]
+
+
+N_fib = {'1A':298, '1B':300, '2A':298, '2B':297, '3A':298, '3B':300, '4A':300, '4B':298}
+
+N_det = 24
+
+idx_lookup = {
+    ("red", "1", "A"): 1,
+    ("green", "1", "A"): 2,
+    ("blue", "1", "A"): 3,
+    ("red", "1", "B"): 4,
+    ("green", "1", "B"): 5,
+    ("blue", "1", "B"): 6,
+    ("red", "2", "A"): 7,
+    ("green", "2", "A"): 8,
+    ("blue", "2", "A"): 9,
+    ("red", "2", "B"): 10,
+    ("green", "2", "B"): 11,
+    ("blue", "2", "B"): 12,
+    ("red", "3", "A"): 13,
+    ("green", "3", "A"): 14,
+    ("blue", "3", "A"): 15,
+    ("red", "3", "B"): 16,
+    ("green", "3", "B"): 17,
+    ("blue", "3", "B"): 18,
+    ("red", "4", "A"): 19,
+    ("green", "4", "A"): 20,
+    ("blue", "4", "A"): 21,
+    ("red", "4", "B"): 22,
+    ("green", "4", "B"): 23,
+    ("blue", "4", "B"): 24
+   
+}
+
+gain_noise_lookup ={
+    ("red", "1", "A"): {'noise': 2.4, 'gain': 1.25},
+    ("green", "1", "A"): {'noise': 2.4, 'gain': 1.25},
+    ("blue", "1", "A"): {'noise': 2.4, 'gain': 1.25},
+    ("red", "1", "B"): {'noise': 2.4, 'gain': 1.25},
+    ("green", "1", "B"): {'noise': 2.4, 'gain': 1.25},
+    ("blue", "1", "B"): {'noise': 2.4, 'gain': 1.25},
+    ("red", "2", "A"): {'noise': 2.4, 'gain': 1.25},
+    ("green", "2", "A"): {'noise': 2.4, 'gain': 1.25},
+    ("blue", "2", "A"): {'noise': 2.4, 'gain': 1.25},
+    ("red", "2", "B"): {'noise': 2.4, 'gain': 1.25},
+    ("green", "2", "B"): {'noise': 2.4, 'gain': 1.25},
+    ("blue", "2", "B"): {'noise': 2.4, 'gain': 1.25},
+    ("red", "3", "A"): {'noise': 2.4, 'gain': 1.25},
+    ("green", "3", "A"): {'noise': 2.4, 'gain': 1.25},
+    ("blue", "3", "A"): {'noise': 2.4, 'gain': 1.25},
+    ("red", "3", "B"): {'noise': 2.4, 'gain': 1.25},
+    ("green", "3", "B"): {'noise': 2.4, 'gain': 1.25},
+    ("blue", "3", "B"): {'noise': 2.4, 'gain': 1.25},
+    ("red", "4", "A"): {'noise': 2.4, 'gain': 1.25},
+    ("green", "4", "A"): {'noise': 2.4, 'gain': 1.25},
+    ("blue", "4", "A"): {'noise': 2.4, 'gain': 1.25},
+    ("red", "4", "B"): {'noise': 2.4, 'gain': 1.25},
+    ("green", "4", "B"): {'noise': 2.4, 'gain': 1.25},
+    ("blue", "4", "B"): {'noise': 2.4, 'gain': 1.25}
+}
+
+#old version-- kkeping for now to check more conservative values
+# LACOSMIC_DEFAULTS = {
+#     'contrast': 5.0,
+#     'cr_threshold': 4.5,
+#     'neighbor_threshold': 0.3,
+#     'effective_gain': 1.25,
+#     'readnoise': 6.9,
+# }
+
+LACOSMIC_DEFAULTS = {
+    'contrast': 5.0,
+    'cr_threshold': 6.5,
+    'neighbor_threshold': 0.7,
+    'effective_gain': 1.25,
+    'readnoise': 6.9,
+    'maxiter': 2
+}
+
+# Per-color overrides (merged on top of LACOSMIC_DEFAULTS)
+LACOSMIC_COLOR_OVERRIDES = {
+    'red': {
+        'cr_threshold': 10.0,
+        'contrast': 9.0,
+        'skip': True,  # disable CR cleaning for red until tuning is finalised
+    },
+}
+
