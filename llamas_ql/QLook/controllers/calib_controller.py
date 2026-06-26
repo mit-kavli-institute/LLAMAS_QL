@@ -11,16 +11,18 @@ from PySide6.QtCore import QObject, Signal
 from llamas_ql.QLook.controllers.calib_detect import CalibPlan
 from llamas_ql.QLook.core.session import Session
 from llamas_ql.QLook.workers.protocol import JobSpec
-from llamas_ql.QLook.workers.reduction_process import ReductionProcess
+from llamas_ql.QLook.workers.reduction_process import ReductionJob, get_worker
 
 
 class CalibController(QObject):
     busy_changed = Signal(bool)
+    #: Emitted on success with the list of cameras that reverted to default masters.
+    trace_fallback = Signal(list)
 
     def __init__(self, session: Session, parent: QObject | None = None):
         super().__init__(parent)
         self.session = session
-        self._proc: ReductionProcess | None = None
+        self._proc: ReductionJob | None = None
 
     @property
     def running(self) -> bool:
@@ -30,19 +32,14 @@ class CalibController(QObject):
         if self.running:
             self._proc.cancel()
 
-    def run(self, plan: CalibPlan) -> ReductionProcess:
+    def run(self, plan: CalibPlan) -> ReductionJob:
         if self.running:
             raise RuntimeError("calibration already running")
         if not plan.is_runnable():
             raise ValueError("calibration plan needs a dome flat")
         self.session.paths.ensure_dirs()
 
-        self._proc = ReductionProcess(self)
-        self._proc.finished.connect(self._on_finished)
-        self._proc.failed.connect(self._on_failed)
-
-        self.busy_changed.emit(True)
-        self._proc.start(
+        self._proc = get_worker().submit(
             JobSpec(
                 kind="calib",
                 inputs=[plan.dome_flat],
@@ -50,6 +47,10 @@ class CalibController(QObject):
                 options={"dome_flat": plan.dome_flat, "twilight": plan.twilight},
             )
         )
+        self._proc.finished.connect(self._on_finished)
+        self._proc.failed.connect(self._on_failed)
+
+        self.busy_changed.emit(True)
         # The chosen bias/arc are recorded on the plan for forward use but are
         # not yet inputs to trace generation — surface that rather than dropping
         # it silently.
@@ -68,6 +69,9 @@ class CalibController(QObject):
 
     def _on_finished(self, payload: dict) -> None:
         self.session.set_calib_ready(True)
+        fallback = payload.get("trace_fallback_cameras") or []
+        if fallback:
+            self.trace_fallback.emit(list(fallback))
         self.busy_changed.emit(False)
         self._proc = None
 

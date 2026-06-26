@@ -14,7 +14,9 @@ import logging
 import gc
 from datetime import datetime
 
-from llamas_ql.Trace.traceLlamasMaster import run_ray_tracing
+# Use the cross-correlating tracer (req #4): each detected comb is matched against
+# the traceLUT.json master comb to enforce the correct fibre count per benchside.
+from llamas_ql.Trace.traceLlamasMulti import run_ray_tracing
 from llamas_ql.config import BASE_DIR, OUTPUT_DIR, DATA_DIR, CALIB_DIR, BIAS_DIR, LUT_DIR, SLOW_BIAS_FILE, FAST_BIAS_FILE
 from llamas_ql.Extract.extractLlamas import ExtractLlamas, save_extractions
 import llamas_ql.GUI.guiExtract as ge
@@ -390,7 +392,7 @@ def extract_flat_field(flat_file_dir, output_dir, slow_bias=None, fast_bias=None
 
 def run_extraction(science_file, output_dir, slow_bias=None, fast_bias=None,
                    trace_dir=None, mastercalib_trace_dir=None,
-                   remove_cosmic_rays=True, mask_output_dir=None):
+                   remove_cosmic_rays=True, mask_output_dir=None, method='optimal'):
     """
     Run spectrum extraction with hybrid trace support.
 
@@ -403,6 +405,7 @@ def run_extraction(science_file, output_dir, slow_bias=None, fast_bias=None,
         mastercalib_trace_dir: Mastercalib trace directory (for placeholder extensions)
         remove_cosmic_rays: Enable L.A.Cosmic cosmic ray removal before extraction
         mask_output_dir: Output directory for cosmic ray mask FITS files
+        method: Extraction method, 'optimal' (default) or 'boxcar' (quick look).
 
     Returns:
         str: Path to extraction file
@@ -423,6 +426,7 @@ def run_extraction(science_file, output_dir, slow_bias=None, fast_bias=None,
                 output_dir=output_dir,
                 slow_bias=slow_bias,
                 fast_bias=fast_bias,
+                method=method,
                 trace_dir=trace_dir,
                 mastercalib_trace_dir=mastercalib_trace_dir,
                 remove_cosmic_rays=remove_cosmic_rays,
@@ -435,6 +439,7 @@ def run_extraction(science_file, output_dir, slow_bias=None, fast_bias=None,
             output_dir=output_dir,
             slow_bias=slow_bias,
             fast_bias=fast_bias,
+            method=method,
             trace_dir=trace_dir,
             mastercalib_trace_dir=mastercalib_trace_dir,
             remove_cosmic_rays=remove_cosmic_rays,

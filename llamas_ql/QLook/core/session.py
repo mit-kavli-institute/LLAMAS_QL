@@ -58,6 +58,7 @@ class Session(QObject):
     calib_ready_changed = Signal(bool)
     rss_loaded = Signal(object)        # RSSData | None
     cube_loaded = Signal(object)       # CubeData | None
+    whitelight_loaded = Signal(object)  # white-light FITS path (str) | None
     selection_changed = Signal(object)  # Selection | None
     pinned_changed = Signal(list)       # list[PinnedSpectrum]
 
@@ -67,6 +68,7 @@ class Session(QObject):
         self._calib_ready = False
         self.current_rss: Any = None    # RSSData
         self.current_cube: Any = None   # CubeData
+        self.current_whitelight: Any = None  # white-light FITS path
         self.selection: Selection | None = None
         self.pinned_spectra: list[PinnedSpectrum] = field(default_factory=list)  # type: ignore
         self.pinned_spectra = []
@@ -101,6 +103,10 @@ class Session(QObject):
     def set_cube(self, cube: Any) -> None:
         self.current_cube = cube
         self.cube_loaded.emit(cube)
+
+    def set_whitelight(self, path: Any) -> None:
+        self.current_whitelight = path
+        self.whitelight_loaded.emit(path)
 
     # -- selection / pins ----------------------------------------------------
 

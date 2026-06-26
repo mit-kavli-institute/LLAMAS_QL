@@ -13,6 +13,7 @@ import os
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QComboBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -128,6 +129,7 @@ class RunPanel(QWidget):
         root.setSpacing(0)
 
         root.addWidget(self._build_header())
+        root.addWidget(self._build_mode_bar())
         root.addWidget(self._build_scroll(), 1)
         root.addWidget(self._build_status())
 
@@ -162,6 +164,31 @@ class RunPanel(QWidget):
         choose.clicked.connect(self._choose_dir)
         lay.addWidget(choose, 0, Qt.AlignVCenter)
         return w
+
+    def _build_mode_bar(self) -> QWidget:
+        """Selector for what the per-file Reduce button produces."""
+        w = QWidget()
+        w.setAttribute(Qt.WA_StyledBackground, True)
+        w.setStyleSheet(f"background:{theme.SURFACE}; border-bottom:1px solid {theme.GRIDLINE};")
+        lay = QHBoxLayout(w)
+        lay.setContentsMargins(14, 6, 14, 6)
+        cap = QLabel("REDUCE AS")
+        cap.setStyleSheet(
+            f"background:transparent; color:{theme.TEXT_SECONDARY}; font-size:10px; letter-spacing:1px;"
+        )
+        self._mode_combo = QComboBox()
+        # (label, mode key)
+        self._mode_combo.addItem("White-light (binary)", "whitelight")
+        self._mode_combo.addItem("Simple cube", "cube")
+        self._mode_combo.addItem("Extract-only RSS", "extract")
+        self._mode_combo.setCurrentIndex(1)  # cube default
+        lay.addWidget(cap)
+        lay.addWidget(self._mode_combo, 1)
+        return w
+
+    def reduction_mode(self) -> str:
+        """Return the selected reduction-mode key ('whitelight'|'cube'|'extract')."""
+        return self._mode_combo.currentData()
 
     def _build_scroll(self) -> QWidget:
         self._scroll = QScrollArea()

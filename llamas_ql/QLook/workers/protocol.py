@@ -39,7 +39,13 @@ REDUCE_STAGES: tuple[str, ...] = (
 )
 
 #: Stages for the afternoon calibration job.
-CALIB_STAGES: tuple[str, ...] = ("validate", "traces", "flatfield")
+CALIB_STAGES: tuple[str, ...] = ("validate", "bias", "traces", "flatfield")
+
+#: Stages for the quick binary white-light job (no extraction).
+WHITELIGHT_STAGES: tuple[str, ...] = ("validate", "bias", "whitelight")
+
+#: Stages for the extraction-only (boxcar RSS) job.
+EXTRACT_STAGES: tuple[str, ...] = ("validate", "extract", "wavelength", "rss")
 
 STATUS_START = "start"
 STATUS_DONE = "done"
@@ -57,9 +63,11 @@ class JobSpec:
     Attributes
     ----------
     kind:
-        ``"reduce"`` (science quick reduction), ``"calib"`` (afternoon
-        calibration processing), ``"plugin"`` (plugin-requested backend work),
-        or ``"dummy"`` (Phase-0 plumbing self-test).
+        ``"reduce"`` (science quick reduction → RSS), ``"cube"`` (build a cube
+        from an RSS), ``"whitelight"`` (binary white-light, no extraction),
+        ``"extract_only"`` (boxcar RSS, no interpolation), ``"calib"`` (afternoon
+        calibration processing), ``"bias"`` (build nightly bias masters),
+        ``"plugin"``, or ``"dummy"`` (Phase-0 plumbing self-test).
     inputs:
         Input file paths relevant to the job (e.g. the science frame, or the
         per-channel flats for a calibration run).
@@ -77,6 +85,8 @@ class JobSpec:
     output_dir: str | None = None
     options: dict[str, Any] = field(default_factory=dict)
     plugin_id: str | None = None
+    #: Correlates events to this job when a persistent worker serves many jobs.
+    job_id: str | None = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self))
@@ -90,42 +100,48 @@ class JobSpec:
             output_dir=data.get("output_dir"),
             options=dict(data.get("options", {})),
             plugin_id=data.get("plugin_id"),
+            job_id=data.get("job_id"),
         )
 
 
 # --- event helpers (used by the runner to emit NDJSON) ----------------------
 
 
-def _emit(stream, obj: dict[str, Any]) -> None:
+def _emit(stream, obj: dict[str, Any], job_id: str | None = None) -> None:
     """Write one NDJSON event line and flush so the GUI sees it promptly."""
+    if job_id is not None:
+        obj["job_id"] = job_id
     stream.write(json.dumps(obj) + "\n")
     stream.flush()
 
 
-def emit_stage(stream, stage: str, status: str, detail: str | None = None) -> None:
+def emit_stage(stream, stage: str, status: str, detail: str | None = None,
+               job_id: str | None = None) -> None:
     obj: dict[str, Any] = {"type": "stage", "stage": stage, "status": status}
     if detail:
         obj["detail"] = detail
-    _emit(stream, obj)
+    _emit(stream, obj, job_id)
 
 
-def emit_progress(stream, pct: int, stage: str | None = None) -> None:
+def emit_progress(stream, pct: int, stage: str | None = None,
+                  job_id: str | None = None) -> None:
     obj: dict[str, Any] = {"type": "progress", "pct": int(pct)}
     if stage:
         obj["stage"] = stage
-    _emit(stream, obj)
+    _emit(stream, obj, job_id)
 
 
-def emit_log(stream, level: str, msg: str, name: str = "") -> None:
-    _emit(stream, {"type": "log", "level": level, "name": name, "msg": msg})
+def emit_log(stream, level: str, msg: str, name: str = "",
+             job_id: str | None = None) -> None:
+    _emit(stream, {"type": "log", "level": level, "name": name, "msg": msg}, job_id)
 
 
-def emit_result(stream, payload: dict[str, Any]) -> None:
-    _emit(stream, {"type": "result", "payload": payload})
+def emit_result(stream, payload: dict[str, Any], job_id: str | None = None) -> None:
+    _emit(stream, {"type": "result", "payload": payload}, job_id)
 
 
-def emit_error(stream, msg: str) -> None:
-    _emit(stream, {"type": "error", "msg": msg})
+def emit_error(stream, msg: str, job_id: str | None = None) -> None:
+    _emit(stream, {"type": "error", "msg": msg}, job_id)
 
 
 def parse_event(line: str) -> dict[str, Any] | None:

@@ -11,7 +11,7 @@ from PySide6.QtCore import QObject, Signal
 from llamas_ql.QLook.core.session import Session
 from llamas_ql.QLook.models.cube_model import CubeData
 from llamas_ql.QLook.workers.protocol import JobSpec
-from llamas_ql.QLook.workers.reduction_process import ReductionProcess
+from llamas_ql.QLook.workers.reduction_process import ReductionJob, get_worker
 
 
 class CubeController(QObject):
@@ -20,7 +20,7 @@ class CubeController(QObject):
     def __init__(self, session: Session, parent: QObject | None = None):
         super().__init__(parent)
         self.session = session
-        self._proc: ReductionProcess | None = None
+        self._proc: ReductionJob | None = None
 
     @property
     def running(self) -> bool:
@@ -30,16 +30,15 @@ class CubeController(QObject):
         if self.running:
             self._proc.cancel()
 
-    def run(self, rss_path: str, grid_method: str = "oversampled") -> ReductionProcess:
+    def run(self, rss_path: str, grid_method: str = "nearest_hex") -> ReductionJob:
         if self.running:
             raise RuntimeError("cube build already running")
-        self._proc = ReductionProcess(self)
+        self._proc = get_worker().submit(
+            JobSpec(kind="cube", inputs=[rss_path], options={"grid_method": grid_method})
+        )
         self._proc.finished.connect(self._on_finished)
         self._proc.failed.connect(self._on_failed)
         self.busy_changed.emit(True)
-        self._proc.start(
-            JobSpec(kind="cube", inputs=[rss_path], options={"grid_method": grid_method})
-        )
         return self._proc
 
     def _on_finished(self, payload: dict) -> None:

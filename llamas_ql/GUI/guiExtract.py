@@ -257,6 +257,25 @@ def process_trace(hdu_data, header, trace_file, hdu_index, method='optimal', use
                     bias = None
 
             if bias is not None:
+                # --- "Wildly off" guard: master bias pedestal vs the frame's own
+                # region-based estimate. A large gap means the wrong read-mode /
+                # corrupt master, so we drop to the region-based fallback below.
+                try:
+                    from llamas_ql.constants import BIAS_OFFSET_WARN_DN, region_bias_level
+
+                    master_level = float(np.nanmedian(bias.data))
+                    region_level = region_bias_level(hdu_data, key=f"{bench}{side}")
+                    if np.isfinite(region_level) and abs(master_level - region_level) > BIAS_OFFSET_WARN_DN:
+                        logger.warning(
+                            f"Bias wildly off for {bench}{side} {color}: master "
+                            f"{master_level:.1f} DN vs region {region_level:.1f} DN "
+                            f"(> {BIAS_OFFSET_WARN_DN} DN) — using region-based fallback"
+                        )
+                        bias = None
+                except Exception as exc:
+                    logger.warning(f"Bias off-check failed for {bench}{side} {color}: {exc}")
+
+            if bias is not None:
                 # --- Inter-fibre diagnostic (informational only) ---
                 # Log the divergence between the raw frame's inter-fibre median and the
                 # master bias's inter-fibre median.  For science frames, this divergence
@@ -299,7 +318,7 @@ def process_trace(hdu_data, header, trace_file, hdu_index, method='optimal', use
                     f"No valid master bias for {bench}{side} {color} — "
                     f"using inter-fibre/test-region fallback."
                 )
-                bias = generate_fallback_bias_hdu(hdu_data, tracer=tracer)
+                bias = generate_fallback_bias_hdu(hdu_data, tracer=tracer, benchside=f"{bench}{side}")
                 logger.info(f"Fallback bias source: {bias.header['BIASSRC']}")
 
             bias_data = bias.data

@@ -812,7 +812,8 @@ class TraceRay(TraceLlamas):
         return
     
     
-    def process_hdu_data(self, hdu_data: np.ndarray, hdu_header: dict, outpath: str = None, use_bias: str = None) -> dict:
+    def process_hdu_data(self, hdu_data: np.ndarray, hdu_header: dict, outpath: str = None,
+                         use_bias: str = None, is_master_calib: bool = True) -> dict:
         """
         Processes HDU (Header Data Unit) data and performs profile fitting.
         Parameters:
@@ -843,8 +844,11 @@ class TraceRay(TraceLlamas):
         color = self.channel.lower()
         print(f'color: {color}')
         
-        filename = f'LLAMAS_master_{self.channel.lower()}_{self.bench}_{self.side}_traces.pkl'
-        
+        if is_master_calib:
+            filename = f'LLAMAS_master_{self.channel.lower()}_{self.bench}_{self.side}_traces.pkl'
+        else:
+            filename = f'LLAMAS_{self.channel.lower()}_{self.bench}_{self.side}_traces.pkl'
+
         if outpath:
             os.makedirs(outpath, exist_ok=True)
             super().saveTraces(filename, newpath=outpath)
@@ -858,77 +862,102 @@ class TraceRay(TraceLlamas):
         if result["status"] != "success":
                 return result
 
-def run_ray_tracing(fitsfile: str, channel: str = None, bias: str = None) -> None:
-    """
-    Perform ray tracing on a FITS file using parallel processing with Ray.
-    This function initializes Ray with the number of available CPU cores, processes
-    each HDU (Header Data Unit) in the FITS file using a remote TraceRay actor, and
-    monitors the processing status, including CPU usage.
-    Parameters:
-    fitsfile (str): The path to the FITS file to be processed.
-    Returns:
-    None
-    """
+def run_ray_tracing(fitsfile: str, channel: str = None, outpath: str = CALIB_DIR,
+                    slow_bias: str = None, fast_bias: str = None,
+                    is_master_calib: bool = True, skip_extension_indices: List[int] = None) -> None:
+    """Trace fibres with Ray, cross-correlating each comb against the master LUT.
 
+    Drop-in replacement for ``traceLlamasMaster.run_ray_tracing`` but using the
+    cross-correlating ``TraceRay`` actor (each detected comb is matched against
+    the ``traceLUT.json`` master comb, enforcing the expected fibre count).
 
-    NUMBER_OF_CORES = int(os.environ.get('LLAMAS_RAY_CPUS', multiprocessing.cpu_count())) 
-    # ray.init(ignore_reinit_error=True, num_cpus=NUMBER_OF_CORES)
-    # Initialize Ray with logging config
+    Args:
+        fitsfile: FITS MEF to trace.
+        channel: Optional channel filter ('red'/'green'/'blue').
+        outpath: Directory for the trace pickles.
+        slow_bias: SLOW-mode master bias path (selected when READ-MDE != FAST).
+        fast_bias: FAST-mode master bias path (selected when READ-MDE == FAST).
+        is_master_calib: True writes ``LLAMAS_master_*`` names; False writes the
+            nightly ``LLAMAS_{color}_{bench}_{side}_traces.pkl`` names.
+        skip_extension_indices: Extension indices to skip (placeholder cameras).
+    """
+    NUMBER_OF_CORES = int(os.environ.get('LLAMAS_RAY_CPUS', multiprocessing.cpu_count()))
     ray.shutdown()  # Clear any existing Ray instances
     ray.init(ignore_reinit_error=True, num_cpus=NUMBER_OF_CORES)
-    
+
     print(f"\nStarting with {NUMBER_OF_CORES} cores available")
     print(f"Current CPU Usage: {psutil.cpu_percent(interval=1)}%")
-    
+
     futures = []
-    results = []    
-    
-    # with fits.open(fitsfile) as hdul:
+    results = []
+
     hdul, _ = process_fits_by_color(fitsfile)
     if hdul is None:
         raise ValueError(f"Failed to process FITS file: {fitsfile}")
+    if len(hdul) < 2:
+        raise ValueError(f"FITS file has no extension HDUs to trace: {fitsfile}")
 
+    # Filter HDUs by channel, tracking extension index so placeholders can be skipped.
     if channel is not None and 'COLOR' in hdul[1].header:
-        hdus = [(hdu.data.astype(float), dict(hdu.header)) for hdu in hdul if hdu.data.astype(float) is not None and hdu.header['COLOR'].lower() == channel.lower()]
+        hdus = [
+            (hdu.data.astype(float), dict(hdu.header))
+            for idx, hdu in enumerate(hdul[1:], start=1)
+            if hdu.data is not None
+            and hdu.header['COLOR'].lower() == channel.lower()
+            and (skip_extension_indices is None or idx not in skip_extension_indices)
+        ]
     elif channel is not None and 'CAM_NAME' in hdul[1].header:
-        hdus = [(hdu.data.astype(float), dict(hdu.header)) for hdu in hdul if hdu.data.astype(float) is not None and hdu.header['CAM_NAME'].split('_')[1].lower() == channel.lower()]
+        hdus = [
+            (hdu.data.astype(float), dict(hdu.header))
+            for idx, hdu in enumerate(hdul[1:], start=1)
+            if hdu.data is not None
+            and hdu.header['CAM_NAME'].split('_')[1].lower() == channel.lower()
+            and (skip_extension_indices is None or idx not in skip_extension_indices)
+        ]
     else:
-        hdus = [(hdu.data.astype(float), dict(hdu.header)) for hdu in hdul if hdu.data.astype(float) is not None]
-    
+        hdus = [
+            (hdu.data.astype(float), dict(hdu.header))
+            for idx, hdu in enumerate(hdul[1:], start=1)
+            if hdu.data is not None
+            and (skip_extension_indices is None or idx not in skip_extension_indices)
+        ]
+
     hdu_processors = [TraceRay.remote(fitsfile) for _ in range(len(hdus))]
     print(f"\nProcessing {len(hdus)} HDUs with {NUMBER_OF_CORES} cores")
-        
-    #hdu_processor = TraceRay.remote(fitsfile)
-        
-    for index, ((hdu_data, hdu_header), processor) in enumerate(zip(hdus, hdu_processors)):
-        future = processor.process_hdu_data.remote(hdu_data, hdu_header, use_bias=bias)
+    if skip_extension_indices:
+        print(f"Skipping {len(skip_extension_indices)} placeholder extension(s): {skip_extension_indices}")
+
+    # Select bias per-file from the primary READ-MDE keyword (slow↔slow, fast↔fast).
+    read_mode = hdul[0].header.get('READ-MDE', 'SLOW').strip().upper()
+    if read_mode == 'FAST' and fast_bias is not None:
+        use_bias = fast_bias
+    elif slow_bias is not None:
+        use_bias = slow_bias
+    else:
+        use_bias = None  # TraceRay / _grab_bias_hdu uses its own defaults
+
+    for (hdu_data, hdu_header), processor in zip(hdus, hdu_processors):
+        future = processor.process_hdu_data.remote(
+            hdu_data, hdu_header, outpath=outpath, use_bias=use_bias,
+            is_master_calib=is_master_calib,
+        )
         futures.append(future)
-    
-    # Monitor processing
+
     total_jobs = len(futures)
     completed = 0
-        
-    # Monitor processing
     print("\nProcessing Status:")
     while futures:
-        
-        # Print current CPU usage every 5 seconds
         if completed % 5 == 0:
             print(f"CPU Usage: {psutil.cpu_percent(percpu=True)}%")
             print(f"Progress: {completed}/{total_jobs} jobs complete")
-        
-        
         done_id, futures = ray.wait(futures)
         result = ray.get(done_id[0])
         results.append(result)
         completed += 1
-        
+
     print(f"\nAll {total_jobs} jobs complete")
     print(f"Final CPU Usage: {psutil.cpu_percent(percpu=True)}%")
-    
     ray.shutdown()
-    
-    
     return
     
     

@@ -8,19 +8,25 @@ reduce/calib/cube controllers and wires the panels together through the session.
 
 from __future__ import annotations
 
+import os
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
 from llamas_ql.QLook.controllers.calib_controller import CalibController
 from llamas_ql.QLook.controllers.cube_controller import CubeController
+from llamas_ql.QLook.controllers.extract_only_controller import ExtractOnlyController
 from llamas_ql.QLook.controllers.reduce_controller import ReduceController
+from llamas_ql.QLook.controllers.whitelight_controller import WhiteLightController
 from llamas_ql.QLook.core import settings as qsettings
+from llamas_ql.QLook.core import theme
 from llamas_ql.QLook.core.session import Session
 from llamas_ql.QLook.widgets.display_panel import DisplayPanel
 from llamas_ql.QLook.widgets.frame_row import REDUCE_DONE, REDUCE_READY, REDUCE_RUNNING
@@ -54,6 +60,8 @@ class MainWindow(QMainWindow):
         self.reduce_controller = ReduceController(self.session, self)
         self.calib_controller = CalibController(self.session, self)
         self.cube_controller = CubeController(self.session, self)
+        self.whitelight_controller = WhiteLightController(self.session, self)
+        self.extract_controller = ExtractOnlyController(self.session, self)
 
         self._build_ui()
         self._wire()
@@ -70,6 +78,9 @@ class MainWindow(QMainWindow):
 
         self.header = HeaderBar(self)
         vbox.addWidget(self.header)
+
+        self.banner = self._build_banner()
+        vbox.addWidget(self.banner)
 
         body = QWidget()
         body_layout = QHBoxLayout(body)
@@ -88,6 +99,35 @@ class MainWindow(QMainWindow):
         vbox.addWidget(self.status)
 
         self.setCentralWidget(root)
+
+    def _build_banner(self) -> QWidget:
+        """A dismissable warning bar (e.g. default-master traces in use)."""
+        w = QWidget()
+        w.setObjectName("banner")
+        w.setAttribute(Qt.WA_StyledBackground, True)
+        w.setStyleSheet(
+            f"QWidget#banner {{ background:{theme.ORANGE_BG}; "
+            f"border-bottom:1px solid {theme.ORANGE_BORDER}; }}"
+        )
+        lay = QHBoxLayout(w)
+        lay.setContentsMargins(14, 6, 10, 6)
+        self._banner_label = QLabel("")
+        self._banner_label.setWordWrap(True)
+        self._banner_label.setStyleSheet(
+            f"background:transparent; color:{theme.ORANGE}; font-size:11px; font-weight:600;"
+        )
+        dismiss = QPushButton("✕")
+        dismiss.setFixedSize(20, 20)
+        dismiss.setCursor(Qt.PointingHandCursor)
+        dismiss.clicked.connect(lambda: self.banner.setVisible(False))
+        lay.addWidget(self._banner_label, 1)
+        lay.addWidget(dismiss)
+        w.setVisible(False)
+        return w
+
+    def show_banner(self, text: str) -> None:
+        self._banner_label.setText(text)
+        self.banner.setVisible(True)
 
     def _build_left(self) -> QWidget:
         self.run_panel = RunPanel(self.session, self)
@@ -109,8 +149,10 @@ class MainWindow(QMainWindow):
         self.run_panel.process_requested.connect(self._on_process)
         self.display_panel.reduce_clicked.connect(self._on_reduce)
         self.display_panel.channel_changed.connect(self._on_channel_changed)
-        self.reduce_controller.busy_changed.connect(self._on_reduce_busy)
         self.calib_controller.busy_changed.connect(self._on_calib_busy)
+        self.calib_controller.trace_fallback.connect(self._on_trace_fallback)
+        self.session.whitelight_loaded.connect(self._on_whitelight_loaded)
+        self._reducing_path = None
 
     # -- frame selection / reduction -----------------------------------------
 
@@ -125,32 +167,63 @@ class MainWindow(QMainWindow):
             self.status.set_state("idle", f"ready · {item.filename}")
         self._selected_item = item
 
+    def _reduce_busy(self) -> bool:
+        return any(c.running for c in (
+            self.reduce_controller, self.whitelight_controller,
+            self.extract_controller, self.cube_controller))
+
     def _on_reduce(self, path: str) -> None:
-        if self.reduce_controller.running:
+        if self._reduce_busy():
             return
+        mode = self.run_panel.reduction_mode()
         self._reducing_path = path
         self.run_panel.set_reduce_state(path, REDUCE_RUNNING)
         item = getattr(self, "_selected_item", None)
         if item is not None and item.path == path:
             self.display_panel.show_reducing(item)
-        self.status.set_state("reducing", f"reducing · {path.split('/')[-1]}")
-        self.reduce_controller.run(path, inspect_channel=self.display_panel.current_channel())
+        self.status.set_state("reducing", f"reducing ({mode}) · {os.path.basename(path)}")
 
-    def _on_reduce_busy(self, busy: bool) -> None:
-        if busy:
+        channel = self.display_panel.current_channel()
+        if mode == "whitelight":
+            job = self.whitelight_controller.run(path)
+            job.finished.connect(lambda _p: self._reduce_done(path, True))
+        elif mode == "extract":
+            job = self.extract_controller.run(path, inspect_channel=channel)
+            job.finished.connect(lambda _p: self._reduce_done(path, True))
+        else:  # cube: optimal reduce -> RSS -> build cube
+            job = self.reduce_controller.run(path, inspect_channel=channel)
+            job.finished.connect(lambda payload: self._chain_cube(path, payload, channel))
+        job.failed.connect(lambda msg: self._reduce_done(path, False, msg))
+        job.log_line.connect(self._on_job_log)
+
+    def _chain_cube(self, path: str, payload: dict, channel: str) -> None:
+        rss = ExtractOnlyController._pick_channel(payload.get("rss_files", []) or [], channel)
+        if not rss:
+            self._reduce_done(path, False, "no RSS produced")
             return
-        path = getattr(self, "_reducing_path", None)
-        if path is not None:
-            done = self.session.current_rss is not None
-            self.run_panel.set_reduce_state(path, REDUCE_DONE if done else REDUCE_READY)
-            self.status.set_state(
-                "complete" if done else "idle",
-                "reduction complete" if done else "reduction failed",
-            )
-            self._reducing_path = None
+        self.status.set_state("reducing", "building cube…")
+        cjob = self.cube_controller.run(rss)
+        cjob.finished.connect(lambda _p: self._reduce_done(path, True))
+        cjob.failed.connect(lambda msg: self._reduce_done(path, False, msg))
+        cjob.log_line.connect(self._on_job_log)
+
+    def _reduce_done(self, path: str, ok: bool, msg: str = "") -> None:
+        self.run_panel.set_reduce_state(path, REDUCE_DONE if ok else REDUCE_READY)
+        self.status.set_state(
+            "complete" if ok else "idle",
+            "reduction complete" if ok else f"reduction failed: {msg}".rstrip(": "),
+        )
+        self._reducing_path = None
+
+    def _on_job_log(self, level: str, text: str) -> None:
+        if level.upper() in ("WARNING", "ERROR"):
+            self.show_banner(text)
+
+    def _on_whitelight_loaded(self, path) -> None:
+        if path:
+            self.status.set_state("complete", f"white-light ready · {os.path.basename(str(path))}")
 
     def _on_channel_changed(self, channel: str) -> None:
-        # Re-pick the matching channel RSS from the last reduction, if available.
         self.status.set_cursor(f"channel · {channel}")
 
     def _on_process(self, plan) -> None:
@@ -167,6 +240,13 @@ class MainWindow(QMainWindow):
                 "calibrations ready" if ready else "calibration done",
             )
 
+    def _on_trace_fallback(self, cameras: list) -> None:
+        n = len(cameras)
+        self.show_banner(
+            f"⚠ {n} camera(s) reverted to DEFAULT master traces — "
+            f"reductions use packaged traces for: " + "; ".join(cameras)
+        )
+
     # -- geometry persistence ------------------------------------------------
 
     def _restore_geometry(self) -> None:
@@ -176,4 +256,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         qsettings.set_bytes("main/geometry", self.saveGeometry())
+        from llamas_ql.QLook.workers.reduction_process import get_worker
+
+        get_worker().shutdown()
         super().closeEvent(event)

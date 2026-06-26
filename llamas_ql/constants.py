@@ -89,3 +89,52 @@ LACOSMIC_COLOR_OVERRIDES = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# Bias regions
+# ---------------------------------------------------------------------------
+# Detector regions (low-signal areas) used to estimate a per-frame bias level
+# when the master-bias path is unusable (read-mode mismatch, missing master, or
+# a master whose level is wildly off the frame). Each region is a
+# ``(y1, y2, x1, x2)`` slice in detector-pixel coords; ``None`` means the full
+# extent on that axis. ``region_bias_level`` medians the union of all regions
+# for a key. Keyed by benchside ('1A'..'4B') with a 'default' fallback.
+#
+# TODO(observer): replace the placeholder 'default' rows with the true bias/
+# overscan regions for LLAMAS detectors; add per-benchside entries as needed.
+BIAS_REGIONS = {
+    'default': [(30, 50, None, None)],  # rows 30-50, all columns (legacy behaviour)
+}
+
+# Max |master-bias median - region-bias estimate| (DN) before the master is
+# judged "wildly off" and the region-based estimate is substituted instead.
+BIAS_OFFSET_WARN_DN = 50.0
+
+
+def region_bias_level(data, key='default'):
+    """Estimate a scalar bias level (DN) from ``BIAS_REGIONS`` for a detector.
+
+    Args:
+        data: 2-D detector frame (anything convertible to float).
+        key: Benchside key (e.g. '2A'); falls back to 'default' if absent.
+
+    Returns:
+        float median over the union of the key's regions, or ``nan`` if no
+        region pixels are available.
+    """
+    import numpy as np
+
+    arr = np.asarray(data, dtype=float)
+    if arr.ndim != 2:
+        return float('nan')
+    regions = BIAS_REGIONS.get(key) or BIAS_REGIONS.get('default', [])
+    pixels = []
+    for (y1, y2, x1, x2) in regions:
+        ys = slice(y1, y2)
+        xs = slice(x1, x2)
+        sub = arr[ys, xs]
+        if sub.size:
+            pixels.append(sub.ravel())
+    if not pixels:
+        return float('nan')
+    return float(np.nanmedian(np.concatenate(pixels)))
+

@@ -70,7 +70,7 @@ class BiasReadModeError(ValueError):
 # Fallback HDU generator
 # ---------------------------------------------------------------------------
 
-def generate_fallback_bias_hdu(frame_data: np.ndarray, tracer=None) -> fits.ImageHDU:
+def generate_fallback_bias_hdu(frame_data: np.ndarray, tracer=None, benchside: str = 'default') -> fits.ImageHDU:
     """
     Construct a minimal, valid fits.ImageHDU filled with a constant bias
     level estimated from the raw frame. Never raises — always returns an HDU
@@ -81,7 +81,7 @@ def generate_fallback_bias_hdu(frame_data: np.ndarray, tracer=None) -> fits.Imag
     1. **Inter-fibre estimate** (preferred when tracer available):
        Median of ``frame_data`` in the inter-fibre gap pixels identified by
        ``tracer.fiberimg == -1`` via ``biasChecking.build_interfibre_mask``.
-    2. **Test-region estimate**: Median of rows 30–50 of ``frame_data``.
+    2. **Region estimate**: Median over ``constants.BIAS_REGIONS[benchside]``.
 
     Cross-validation rule (``cross_check_threshold = 5 DN``):
     * If the two estimates agree within 5 DN → use the inter-fibre estimate
@@ -139,25 +139,25 @@ def generate_fallback_bias_hdu(frame_data: np.ndarray, tracer=None) -> fits.Imag
     except Exception as exc:
         logger.warning(f"generate_fallback_bias_hdu: inter-fibre estimate failed ({exc})")
 
-    # --- Test-region estimate (rows 30–50) ---
+    # --- Test-region estimate (configurable BIAS_REGIONS) ---
     est_test_region = float('nan')
     try:
-        if shape[0] > 50:
-            region = data[30:50, :]
-            if region.size > 0:
-                est_test_region = float(np.nanmedian(region))
-                logger.info(
-                    f"generate_fallback_bias_hdu: test-region estimate="
-                    f"{est_test_region:.2f} DN from rows 30-50"
-                )
+        from llamas_ql.constants import region_bias_level
+
+        est_test_region = region_bias_level(data, key=benchside)
+        if not np.isnan(est_test_region):
+            logger.info(
+                f"generate_fallback_bias_hdu: region estimate="
+                f"{est_test_region:.2f} DN from BIAS_REGIONS[{benchside!r}]"
+            )
         else:
             logger.warning(
-                "generate_fallback_bias_hdu: frame has fewer than 50 rows; "
-                "test-region estimate unavailable"
+                "generate_fallback_bias_hdu: BIAS_REGIONS yielded no pixels; "
+                "region estimate unavailable"
             )
     except Exception as exc:
         logger.warning(
-            f"generate_fallback_bias_hdu: test-region estimate failed ({exc})"
+            f"generate_fallback_bias_hdu: region estimate failed ({exc})"
         )
 
     # --- Cross-validate and select ---
@@ -183,7 +183,7 @@ def generate_fallback_bias_hdu(frame_data: np.ndarray, tracer=None) -> fits.Imag
                 bias_src   = 'interfibre_mask'
             else:
                 bias_level = est_test_region
-                bias_src   = 'rows_30_50_median'
+                bias_src   = 'bias_regions'
             logger.warning(
                 f"generate_fallback_bias_hdu: estimates diverge "
                 f"({divergence:.2f} DN > {_CROSS_CHECK_THRESHOLD} DN); "
@@ -195,7 +195,7 @@ def generate_fallback_bias_hdu(frame_data: np.ndarray, tracer=None) -> fits.Imag
         bias_src   = 'interfibre_mask'
     elif not np.isnan(est_test_region):
         bias_level = est_test_region
-        bias_src   = 'rows_30_50_median'
+        bias_src   = 'bias_regions'
     else:
         bias_level = 0.0
         bias_src   = 'zero_fallback'

@@ -14,7 +14,7 @@ from PySide6.QtCore import QObject, Signal
 from llamas_ql.QLook.core.session import Session
 from llamas_ql.QLook.models.rss_model import RSSData
 from llamas_ql.QLook.workers.protocol import JobSpec
-from llamas_ql.QLook.workers.reduction_process import ReductionProcess
+from llamas_ql.QLook.workers.reduction_process import ReductionJob, get_worker
 
 
 class ReduceController(QObject):
@@ -23,15 +23,11 @@ class ReduceController(QObject):
     def __init__(self, session: Session, parent: QObject | None = None):
         super().__init__(parent)
         self.session = session
-        self._proc: ReductionProcess | None = None
-        self._inspect_channel = "red"
-        # Signals re-exposed for the LogDock to connect to.
-        self.log_line = None
-        self.progress = None
-        self.stage = None
+        self._proc: ReductionJob | None = None
+        self._inspect_channel = "green"
 
     @property
-    def proc(self) -> ReductionProcess | None:
+    def proc(self) -> ReductionJob | None:
         return self._proc
 
     @property
@@ -42,8 +38,8 @@ class ReduceController(QObject):
         if self.running:
             self._proc.cancel()
 
-    def run(self, science_file: str, inspect_channel: str = "red") -> ReductionProcess:
-        """Start a reduction for ``science_file``; return the process to wire UI to."""
+    def run(self, science_file: str, inspect_channel: str = "green") -> ReductionJob:
+        """Start a reduction for ``science_file``; return the job to wire UI to."""
         if self.running:
             raise RuntimeError("a reduction is already running")
         self._inspect_channel = inspect_channel
@@ -54,12 +50,7 @@ class ReduceController(QObject):
         if os.path.isdir(trace_dir) and os.listdir(trace_dir):
             options["trace_dir"] = trace_dir  # else runner falls back to mastercalib
 
-        self._proc = ReductionProcess(self)
-        self._proc.finished.connect(self._on_finished)
-        self._proc.failed.connect(self._on_failed)
-
-        self.busy_changed.emit(True)
-        self._proc.start(
+        self._proc = get_worker().submit(
             JobSpec(
                 kind="reduce",
                 inputs=[science_file],
@@ -67,6 +58,9 @@ class ReduceController(QObject):
                 options=options,
             )
         )
+        self._proc.finished.connect(self._on_finished)
+        self._proc.failed.connect(self._on_failed)
+        self.busy_changed.emit(True)
         return self._proc
 
     # -- completion ----------------------------------------------------------
