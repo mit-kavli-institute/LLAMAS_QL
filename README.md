@@ -46,9 +46,31 @@ These are git-ignored and "follow" the install to the observing machine, at the 
 - `llamas_ql/mastercalib/LLAMAS_master_<color>_<bench>_<side>_traces.pkl` (×24)
 - `llamas_ql/LUT/LLAMAS_reference_arc.pkl` (~4.5 GB; for wavelength application)
 
+**Automatic fallback to `llamas-pyjamas`.** When these local copies are absent (e.g. a
+dev checkout), `config.py` resolves the master traces, master biases and the reference
+arc from an **installed `llamas_pyjamas`** package instead (located on `sys.path` via
+`importlib.machinery.PathFinder`, so the pickle-compat alias in `__init__.py` doesn't
+interfere). Precedence for science reduction is: freshly-processed **nightly** cals →
+local packaged masters → `llamas-pyjamas` masters. The master libraries are treated as
+**read-only**: nightly trace generation writes to `output/traces` and a guard
+(`config.guard_not_master_dir`) refuses any write into a master directory, so masters are
+never overwritten.
+
 Small text LUTs (`LLAMAS_FiberMap_rev04.dat`, `traceLUT.json`, `*_peaks.csv`,
 `ThAr_MagE_lines.dat`) are committed. If the master bias is missing, the bias stage
 falls back to an estimated constant bias (`generate_fallback_bias_hdu`).
+
+## Quick Look GUI (`llamas-ql-gui`)
+
+The default **Reduce** action is a fast, *progressive* quick look (`quicklook` job):
+a white-light image is shown first, then per-fibre boxcar spectra on a clickable hex
+fibre map (pixel-index axis — the 4.5 GB arc is skipped for speed), then a simple cube
+if it finishes in time. The older `whitelight` / `cube` / `extract` modes remain in the
+"Reduce As" selector. Cosmic-ray removal is off by default in quick look.
+
+The reduction subprocess keeps one warm Ray session across jobs (no per-frame re-init),
+and a per-job watchdog surfaces a hung job as a failure instead of blocking forever —
+tune it with `LLAMAS_QL_JOB_TIMEOUT` (seconds, default 600).
 
 > Note on trace pickles: master traces created by the original `llamas_pyjamas` package
 > load via a compatibility shim in `llamas_ql/__init__.py`. Preferably regenerate traces

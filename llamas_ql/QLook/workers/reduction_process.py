@@ -8,6 +8,7 @@ into Qt signals.  Keeps all Ray/pypeit work out of the GUI process.
 from __future__ import annotations
 
 import itertools
+import os
 import sys
 
 from PySide6.QtCore import QObject, QProcess, QTimer, Signal
@@ -23,6 +24,18 @@ from llamas_ql.QLook.workers.protocol import (
 
 #: Grace period (ms) after terminate() before we hard-kill the child.
 _KILL_GRACE_MS = 5000
+
+
+def _job_timeout_ms() -> int:
+    """Per-job watchdog timeout in ms (0 disables). Override with
+    ``LLAMAS_QL_JOB_TIMEOUT`` (seconds). Default 600 s — a generous safety net,
+    not a tight bound: a genuinely-slow reduce should still finish inside it,
+    while a silently-hung Ray call is converted into a surfaced failure."""
+    try:
+        secs = float(os.environ.get("LLAMAS_QL_JOB_TIMEOUT", "600"))
+    except (TypeError, ValueError):
+        secs = 600.0
+    return max(0, int(secs * 1000))
 
 #: Expected stage ladders per job kind (for UI scaffolding).
 _STAGE_LADDERS = {
@@ -51,6 +64,7 @@ class ReductionProcess(QObject):
     log_line = Signal(str, str)
     progress = Signal(int, str)
     stage = Signal(str, str)
+    partial = Signal(dict)
     finished = Signal(dict)
     failed = Signal(str)
 
@@ -143,6 +157,8 @@ class ReductionProcess(QObject):
             self.progress.emit(int(event.get("pct", 0)), event.get("stage", ""))
         elif etype == "stage":
             self.stage.emit(event.get("stage", ""), event.get("status", ""))
+        elif etype == "partial":
+            self.partial.emit(dict(event.get("payload", {})))
         elif etype == "result":
             self._result = dict(event.get("payload", {}))
         elif etype == "error":
@@ -188,6 +204,7 @@ class ReductionJob(QObject):
     log_line = Signal(str, str)
     progress = Signal(int, str)
     stage = Signal(str, str)
+    partial = Signal(dict)
     finished = Signal(dict)
     failed = Signal(str)
 
@@ -215,6 +232,10 @@ class ReductionJob(QObject):
             self.progress.emit(int(event.get("pct", 0)), event.get("stage", ""))
         elif etype == "stage":
             self.stage.emit(event.get("stage", ""), event.get("status", ""))
+
+    def _emit_partial(self, event: dict) -> None:
+        """A non-terminal intermediate artefact — the job stays open."""
+        self.partial.emit(dict(event.get("payload", {})))
 
     def _complete(self, payload: dict | None, error: str | None) -> None:
         if self._done:
@@ -246,6 +267,13 @@ class ReductionWorker(QObject):
         self._queue: list[str] = []
         self._current: str | None = None
         self._cancelled: str | None = None  # job whose kill is a deliberate cancel
+        self._abort_reason: str = "cancelled"  # message used when a kill fails a job
+        # Watchdog: converts a silently-hung job (no result/error ever emitted)
+        # into a surfaced failure + worker restart, so the GUI never sticks on
+        # "reducing…" forever.
+        self._watchdog = QTimer(self)
+        self._watchdog.setSingleShot(True)
+        self._watchdog.timeout.connect(self._on_watchdog_timeout)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -293,6 +321,7 @@ class ReductionWorker(QObject):
             # No clean mid-run cancel in a shared process: abort the current job by
             # killing the worker; _on_proc_finished fails only it and resumes the
             # rest of the queue in a fresh worker.
+            self._abort_reason = "cancelled"
             self._cancelled = job_id
             self._proc.kill()
 
@@ -319,12 +348,22 @@ class ReductionWorker(QObject):
         self._current = self._queue.pop(0)
         spec = self._jobs[self._current].spec
         self._proc.write((spec.to_json() + "\n").encode("utf-8"))
+        timeout_ms = _job_timeout_ms()
+        if timeout_ms > 0:
+            self._watchdog.start(timeout_ms)
 
     # -- stdout routing ------------------------------------------------------
 
     def _on_stdout(self) -> None:
         if self._proc is None:
             return
+        # Any output means the job is alive and working (logs, progress, Ray
+        # chatter): restart the watchdog so it fires only on true silence (a
+        # deadlocked Ray call produces no output), not on a slow-but-busy job.
+        if self._current is not None:
+            timeout_ms = _job_timeout_ms()
+            if timeout_ms > 0:
+                self._watchdog.start(timeout_ms)
         self._buf += bytes(self._proc.readAllStandardOutput()).decode("utf-8", "replace")
         while "\n" in self._buf:
             line, self._buf = self._buf.split("\n", 1)
@@ -339,7 +378,11 @@ class ReductionWorker(QObject):
         if job is None:
             return
         etype = event.get("type")
-        if etype == "result":
+        if etype == "partial":
+            # Non-terminal: publish the artefact but keep the job open. Must be
+            # handled before result/error, which pop the job and stop routing.
+            job._emit_partial(event)
+        elif etype == "result":
             self._finish(job_id, dict(event.get("payload", {})), None)
         elif etype == "error":
             self._finish(job_id, None, event.get("msg", "unknown error"))
@@ -351,27 +394,44 @@ class ReductionWorker(QObject):
         if job is not None:
             job._complete(payload, error)
         if self._current == job_id:
+            self._watchdog.stop()
             self._current = None
             self._pump()
 
     # -- failures ------------------------------------------------------------
+
+    def _on_watchdog_timeout(self) -> None:
+        """A running job emitted no result/error within the timeout window.
+
+        Treat it like a forced cancel with a distinct reason: kill the worker so
+        the hung job fails loudly, then resume the rest of the queue in a fresh
+        worker (handled by :meth:`_on_proc_finished`)."""
+        if self._current is None or not self.alive:
+            return
+        secs = _job_timeout_ms() // 1000
+        self._abort_reason = f"job timed out after {secs}s (no response from the reducer)"
+        self._cancelled = self._current
+        self._proc.kill()
 
     def _on_proc_error(self, err) -> None:
         if err == QProcess.FailedToStart:
             self._fail_all("reduction worker failed to start")
 
     def _on_proc_finished(self, exit_code: int, exit_status) -> None:
+        self._watchdog.stop()
         if self._buf.strip():
             self._route(self._buf)
             self._buf = ""
         self._proc = None
         cancelled = self._cancelled
         self._cancelled = None
+        reason = self._abort_reason
+        self._abort_reason = "cancelled"
         if cancelled is not None:
-            # Deliberate cancel-kill: fail only the cancelled job, keep the queue,
-            # and resume it in a fresh worker.
+            # Deliberate cancel/timeout kill: fail only that job with its reason,
+            # keep the queue, and resume it in a fresh worker.
             self._current = None
-            self._finish(cancelled, None, "cancelled")
+            self._finish(cancelled, None, reason)
             self._pump()
         elif self._jobs:
             # Unexpected exit: fail everything (likely a systemic backend error).

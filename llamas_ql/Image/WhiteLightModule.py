@@ -40,6 +40,7 @@ from scipy.interpolate import LinearNDInterpolator
 from llamas_ql.File.llamasIO import process_fits_by_color
 from llamas_ql.DataModel.validate import get_placeholder_extension_indices, validate_for_gui
 from llamas_ql.Trace.traceLlamasMaster import _grab_bias_hdu
+from llamas_ql.Bias.biasChecking import build_topbottom_stripe_mask, measure_edge_dc_offset
 
 from matplotlib.patches import RegularPolygon
 import matplotlib.cm as cm
@@ -1081,12 +1082,6 @@ def QuickWhiteLightCube(science_file, bias: str = None, ds9plot: bool = False, o
             bias_hdu = _grab_bias_hdu(bench=bench, side=side, color=color, dir=masterbiasfile)
             data = ext.data.astype(float) - bias_hdu.data
 
-            # Step 2 (FAST only): compute average from (science - bias) frame, then subtract it
-            if read_mode == 'FAST':
-                residual_bg = compute_residual_background(data)
-                data = data - residual_bg
-                logger.info(f"Extension {i} ({benchside} {color}): FAST residual bg = {residual_bg:.2f}")
-
             # Determine the corresponding trace file based on benchside and color
             #LLAMAS_master_blue_1_A_traces.pkl
             trace_filename = f"LLAMAS_master_{color}_{bench}_{side}_traces.pkl"
@@ -1097,6 +1092,16 @@ def QuickWhiteLightCube(science_file, bias: str = None, ds9plot: bool = False, o
 
             with open(trace_filepath, "rb") as f:
                 trace_obj = pickle.load(f)
+
+            # Step 2: per-frame edge-bias (DC offset) from unilluminated stripes.
+            # Shares the extraction path's bias model and applies for BOTH read
+            # modes (replaces the old FAST-only residual-background subtraction).
+            stripe_mask = build_topbottom_stripe_mask(trace_obj, data.shape)
+            edge_dc, n_edge, edge_src = measure_edge_dc_offset(data, stripe_mask)
+            if edge_src == 'ok':
+                data = data - edge_dc
+                logger.info(f"Extension {i} ({benchside} {color}): edge-bias = "
+                            f"{edge_dc:.2f} DN (n={n_edge})")
 
             # Build trace and data lists for QuickWhiteLight processing
             metadata = {'channel': color, 'bench': bench, 'side': side}

@@ -43,7 +43,7 @@ import multiprocessing
 import argparse
 import cloudpickle
 from scipy.signal import find_peaks
-from llamas_ql.config import BASE_DIR, OUTPUT_DIR, DATA_DIR, LUT_DIR, CALIB_DIR, BIAS_DIR
+from llamas_ql.config import BASE_DIR, OUTPUT_DIR, DATA_DIR, LUT_DIR, CALIB_DIR, BIAS_DIR, guard_not_master_dir
 import pkg_resources
 from pathlib import Path
 import rpdb
@@ -740,9 +740,13 @@ class TraceLlamas:
         
         return (fiberimg, profimg, bpmask)
     
-    def saveTraces(self, outfile='LLAMASTrace.pkl', newpath=None)-> None:
+    def saveTraces(self, outfile='LLAMASTrace.pkl', newpath=None, allow_master=False)-> None:
         """
         Save trace data to a specified file format.
+
+        ``allow_master`` must be True to write into a master-calibration library
+        (only the deliberate master-trace builder does this); nightly/science
+        generation leaves it False so the guard below blocks accidental writes.
         Parameters:
         outfile (str): The name of the output file. Default is 'LLAMASTrace.pkl'.
                        Supported formats are '.pkl' for pickle files and '.h5' for HDF5 files.
@@ -763,13 +767,17 @@ class TraceLlamas:
         
         
         if newpath:
-            print(f'Making directory newpath: {newpath}')   
-            path = os.path.dirname(newpath)
-            os.makedirs(path, exist_ok=True)
-            outpath = outpath = os.path.join(newpath, outfile)
+            target_dir = newpath
         else:
-            os.makedirs(CALIB_DIR, exist_ok=True)
-            outpath = os.path.join(CALIB_DIR, outfile)
+            # Never default-write into the read-only master library: a falsy
+            # newpath means the caller didn't request a nightly location, so use
+            # OUTPUT_DIR (a safe, writable scratch dir) rather than CALIB_DIR.
+            print(f'No newpath given for traces; writing to OUTPUT_DIR: {OUTPUT_DIR}')
+            target_dir = OUTPUT_DIR
+        if not allow_master:
+            guard_not_master_dir(target_dir)
+        os.makedirs(target_dir, exist_ok=True)
+        outpath = os.path.join(target_dir, outfile)
         
         
 
@@ -851,10 +859,10 @@ class TraceRay(TraceLlamas):
 
         if outpath:
             os.makedirs(outpath, exist_ok=True)
-            super().saveTraces(filename, newpath=outpath)
+            super().saveTraces(filename, newpath=outpath, allow_master=is_master_calib)
         else:
-            super().saveTraces(filename)
-        
+            super().saveTraces(filename, allow_master=is_master_calib)
+
         
     
         
@@ -862,7 +870,7 @@ class TraceRay(TraceLlamas):
         if result["status"] != "success":
                 return result
 
-def run_ray_tracing(fitsfile: str, channel: str = None, outpath: str = CALIB_DIR,
+def run_ray_tracing(fitsfile: str, channel: str = None, outpath: str = OUTPUT_DIR,
                     slow_bias: str = None, fast_bias: str = None,
                     is_master_calib: bool = True, skip_extension_indices: List[int] = None) -> None:
     """Trace fibres with Ray, cross-correlating each comb against the master LUT.
@@ -881,9 +889,11 @@ def run_ray_tracing(fitsfile: str, channel: str = None, outpath: str = CALIB_DIR
             nightly ``LLAMAS_{color}_{bench}_{side}_traces.pkl`` names.
         skip_extension_indices: Extension indices to skip (placeholder cameras).
     """
+    # Share the single, process-wide Ray session (initialised once, kept warm)
+    # rather than shutting down/reinitialising per calibration run.
+    from llamas_ql.ray_session import ensure_ray
+    ensure_ray()
     NUMBER_OF_CORES = int(os.environ.get('LLAMAS_RAY_CPUS', multiprocessing.cpu_count()))
-    ray.shutdown()  # Clear any existing Ray instances
-    ray.init(ignore_reinit_error=True, num_cpus=NUMBER_OF_CORES)
 
     print(f"\nStarting with {NUMBER_OF_CORES} cores available")
     print(f"Current CPU Usage: {psutil.cpu_percent(interval=1)}%")
@@ -957,7 +967,8 @@ def run_ray_tracing(fitsfile: str, channel: str = None, outpath: str = CALIB_DIR
 
     print(f"\nAll {total_jobs} jobs complete")
     print(f"Final CPU Usage: {psutil.cpu_percent(percpu=True)}%")
-    ray.shutdown()
+    # Do NOT ray.shutdown() here: the persistent worker keeps one warm Ray
+    # session across jobs (see llamas_ql/ray_session.ensure_ray).
     return
     
     

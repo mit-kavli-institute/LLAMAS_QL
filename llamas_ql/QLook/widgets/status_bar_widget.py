@@ -14,6 +14,7 @@ _STATE_COLORS = {
     "idle": "#7e8186",
     "reducing": "#e0a52f",
     "complete": "#3fbf6f",
+    "ready": "#3fbf6f",
 }
 
 
@@ -53,7 +54,7 @@ class StatusBarWidget(QWidget):
         layout.addWidget(self._version)
 
     def set_state(self, state: str, text: str) -> None:
-        """state ∈ {idle, reducing, complete}; text is the human message."""
+        """state ∈ {idle, reducing, complete, ready}; text is the human message."""
         color = _STATE_COLORS.get(state, _STATE_COLORS["idle"])
         self._dot.setStyleSheet(
             f"background:transparent; color:{color}; font-family:'{theme.mono_family()}'; font-size:11px;"

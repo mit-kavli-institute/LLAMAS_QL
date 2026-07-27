@@ -178,16 +178,18 @@ class RunPanel(QWidget):
         )
         self._mode_combo = QComboBox()
         # (label, mode key)
+        self._mode_combo.addItem("Quick look (fast, progressive)", "quicklook")
         self._mode_combo.addItem("White-light (binary)", "whitelight")
         self._mode_combo.addItem("Simple cube", "cube")
         self._mode_combo.addItem("Extract-only RSS", "extract")
-        self._mode_combo.setCurrentIndex(1)  # cube default
+        self._mode_combo.setCurrentIndex(0)  # progressive quick look is the default
         lay.addWidget(cap)
         lay.addWidget(self._mode_combo, 1)
         return w
 
     def reduction_mode(self) -> str:
-        """Return the selected reduction-mode key ('whitelight'|'cube'|'extract')."""
+        """Return the selected reduction-mode key
+        ('quicklook'|'whitelight'|'cube'|'extract')."""
         return self._mode_combo.currentData()
 
     def _build_scroll(self) -> QWidget:

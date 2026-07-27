@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 from llamas_ql.QLook.controllers.calib_controller import CalibController
 from llamas_ql.QLook.controllers.cube_controller import CubeController
 from llamas_ql.QLook.controllers.extract_only_controller import ExtractOnlyController
+from llamas_ql.QLook.controllers.quicklook_controller import QuickLookController
 from llamas_ql.QLook.controllers.reduce_controller import ReduceController
 from llamas_ql.QLook.controllers.whitelight_controller import WhiteLightController
 from llamas_ql.QLook.core import settings as qsettings
@@ -57,6 +58,7 @@ class MainWindow(QMainWindow):
         self.resize(1280, 800)
 
         self.session = Session()
+        self.quicklook_controller = QuickLookController(self.session, self)
         self.reduce_controller = ReduceController(self.session, self)
         self.calib_controller = CalibController(self.session, self)
         self.cube_controller = CubeController(self.session, self)
@@ -149,9 +151,12 @@ class MainWindow(QMainWindow):
         self.run_panel.process_requested.connect(self._on_process)
         self.display_panel.reduce_clicked.connect(self._on_reduce)
         self.display_panel.channel_changed.connect(self._on_channel_changed)
+        self.display_panel._cube_viewer.build_requested.connect(self._on_build_cube)
         self.calib_controller.busy_changed.connect(self._on_calib_busy)
         self.calib_controller.trace_fallback.connect(self._on_trace_fallback)
         self.session.whitelight_loaded.connect(self._on_whitelight_loaded)
+        self.session.rss_loaded.connect(self._on_rss_ready)
+        self.display_panel.hover_fiber.connect(self._on_hover_fiber)
         self._reducing_path = None
 
     # -- frame selection / reduction -----------------------------------------
@@ -169,8 +174,9 @@ class MainWindow(QMainWindow):
 
     def _reduce_busy(self) -> bool:
         return any(c.running for c in (
-            self.reduce_controller, self.whitelight_controller,
-            self.extract_controller, self.cube_controller))
+            self.quicklook_controller, self.reduce_controller,
+            self.whitelight_controller, self.extract_controller,
+            self.cube_controller))
 
     def _on_reduce(self, path: str) -> None:
         if self._reduce_busy():
@@ -184,7 +190,12 @@ class MainWindow(QMainWindow):
         self.status.set_state("reducing", f"reducing ({mode}) · {os.path.basename(path)}")
 
         channel = self.display_panel.current_channel()
-        if mode == "whitelight":
+        if mode == "quicklook":
+            # Progressive: the controller publishes white-light → RSS → cube as
+            # each streams in; we just track completion here.
+            job = self.quicklook_controller.run(path, inspect_channel=channel)
+            job.finished.connect(lambda _p: self._reduce_done(path, True))
+        elif mode == "whitelight":
             job = self.whitelight_controller.run(path)
             job.finished.connect(lambda _p: self._reduce_done(path, True))
         elif mode == "extract":
@@ -221,7 +232,26 @@ class MainWindow(QMainWindow):
 
     def _on_whitelight_loaded(self, path) -> None:
         if path:
+            self.display_panel.show_whitelight_image(path)
             self.status.set_state("complete", f"white-light ready · {os.path.basename(str(path))}")
+
+    def _on_rss_ready(self, rss) -> None:
+        """Extracted spectra have landed: announce the clickable fibre map."""
+        if rss is not None:
+            self.status.set_state("ready", "SPECTRA READY · click a fibre for its spectrum")
+
+    def _on_hover_fiber(self, row) -> None:
+        self.status.set_cursor(f"fiber {row}" if row is not None else "")
+
+    def _on_build_cube(self, rss_path: str) -> None:
+        """Manual 'Build Cube from current RSS' from the cube viewer."""
+        if not rss_path or self._reduce_busy():
+            return
+        self.status.set_state("reducing", "building cube…")
+        cjob = self.cube_controller.run(rss_path)
+        cjob.finished.connect(lambda _p: self.status.set_state("complete", "cube ready"))
+        cjob.failed.connect(lambda msg: self._on_job_log("ERROR", f"cube failed: {msg}"))
+        cjob.log_line.connect(self._on_job_log)
 
     def _on_channel_changed(self, channel: str) -> None:
         self.status.set_cursor(f"channel · {channel}")

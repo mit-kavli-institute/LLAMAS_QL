@@ -44,7 +44,7 @@ import multiprocessing
 import argparse
 import cloudpickle
 from scipy.signal import find_peaks
-from llamas_ql.config import BASE_DIR, OUTPUT_DIR, DATA_DIR, LUT_DIR, CALIB_DIR, BIAS_DIR
+from llamas_ql.config import BASE_DIR, OUTPUT_DIR, DATA_DIR, LUT_DIR, CALIB_DIR, BIAS_DIR, guard_not_master_dir
 import pkg_resources
 from pathlib import Path
 import rpdb
@@ -860,17 +860,21 @@ class TraceLlamas:
         
         return (fiberimg, profimg, bpmask)
     
-    def saveTraces(self, outfile='LLAMASTrace.pkl', newpath=None)-> None:
-        
-        
+    def saveTraces(self, outfile='LLAMASTrace.pkl', newpath=None, allow_master=False)-> None:
+        # ``allow_master`` must be True to write into a master-calibration library
+        # (only the deliberate master-trace builder does); nightly/science
+        # generation leaves it False so the guard blocks accidental writes.
         if newpath:
-            print(f'Making directory newpath: {newpath}')   
-            path = os.path.dirname(newpath)
-            os.makedirs(path, exist_ok=True)
-            outpath = outpath = os.path.join(newpath, outfile)
+            target_dir = newpath
         else:
-            os.makedirs(CALIB_DIR, exist_ok=True)
-            outpath = os.path.join(CALIB_DIR, outfile)
+            # Never default-write into the read-only master library (see
+            # traceLlamasMulti.saveTraces): fall back to OUTPUT_DIR, not CALIB_DIR.
+            print(f'No newpath given for traces; writing to OUTPUT_DIR: {OUTPUT_DIR}')
+            target_dir = OUTPUT_DIR
+        if not allow_master:
+            guard_not_master_dir(target_dir)
+        os.makedirs(target_dir, exist_ok=True)
+        outpath = os.path.join(target_dir, outfile)
         
             
         print(f'outpath: {outpath}')
@@ -936,9 +940,9 @@ class TraceRay(TraceLlamas):
         
         if outpath:
             os.makedirs(outpath, exist_ok=True)
-            super().saveTraces(filename, newpath=outpath)
+            super().saveTraces(filename, newpath=outpath, allow_master=is_master_calib)
         else:
-            super().saveTraces(filename)
+            super().saveTraces(filename, allow_master=is_master_calib)
         
         
         
@@ -947,7 +951,7 @@ class TraceRay(TraceLlamas):
         
         elapsed_time = time.time() - start_time
 
-def run_ray_tracing(fitsfile: str, channel: str = None, outpath: str = CALIB_DIR,
+def run_ray_tracing(fitsfile: str, channel: str = None, outpath: str = OUTPUT_DIR,
                     slow_bias: str = None, fast_bias: str = None,
                     is_master_calib: bool = True, skip_extension_indices: List[int] = None) -> None:
     """
@@ -1090,7 +1094,9 @@ if __name__ == "__main__":
     run_ray_tracing(
         args.filename,
         channel=args.channel,
-        outpath=args.outpath if args.outpath else CALIB_DIR,
+        # Deliberate master builds target THIS package's mastercalib, never the
+        # resolved CALIB_DIR (which may point at a foreign llamas-pyjamas install).
+        outpath=args.outpath if args.outpath else os.path.join(BASE_DIR, 'mastercalib'),
         use_bias=args.bias,
         is_master_calib=args.mastercalib,
         skip_extension_indices=skip_indices

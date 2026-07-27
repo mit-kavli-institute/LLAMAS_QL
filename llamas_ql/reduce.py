@@ -17,7 +17,7 @@ from datetime import datetime
 # Use the cross-correlating tracer (req #4): each detected comb is matched against
 # the traceLUT.json master comb to enforce the correct fibre count per benchside.
 from llamas_ql.Trace.traceLlamasMulti import run_ray_tracing
-from llamas_ql.config import BASE_DIR, OUTPUT_DIR, DATA_DIR, CALIB_DIR, BIAS_DIR, LUT_DIR, SLOW_BIAS_FILE, FAST_BIAS_FILE
+from llamas_ql.config import BASE_DIR, OUTPUT_DIR, DATA_DIR, CALIB_DIR, BIAS_DIR, LUT_DIR, SLOW_BIAS_FILE, FAST_BIAS_FILE, resolve_reference_arc
 from llamas_ql.Extract.extractLlamas import ExtractLlamas, save_extractions
 import llamas_ql.GUI.guiExtract as ge
 from llamas_ql.File.llamasIO import process_fits_by_color
@@ -207,10 +207,11 @@ def validate_pipeline_config(config: dict, config_path: str) -> bool:
     # 5. LUT reference arc check
     # ------------------------------------------------------------------
     if not config.get('generate_new_wavelength_soln'):
-        ref_arc = os.path.join(LUT_DIR, 'LLAMAS_reference_arc.pkl')
-        if not os.path.isfile(ref_arc):
+        ref_arc = resolve_reference_arc()
+        if not ref_arc:
             errors.append(
-                f"Reference arc not found: '{ref_arc}'. "
+                f"Reference arc 'LLAMAS_reference_arc.pkl' not found in the local "
+                f"LUT dir ('{LUT_DIR}') or an installed llamas-pyjamas LUT dir. "
                 f"Set 'generate_new_wavelength_soln = true' and provide 'arc_file' to generate one, "
                 f"or place the reference arc pickle at the expected location."
             )
@@ -390,9 +391,36 @@ def extract_flat_field(flat_file_dir, output_dir, slow_bias=None, fast_bias=None
     return
 
 
+def build_edge_bias_config(config, extraction_path, flat_field_dir=None):
+    """Assemble the per-frame edge-bias settings into a Ray-serialisable dict.
+
+    Consumed by ``GUI_extract``/``process_trace``.  ``config`` is any dict-like of
+    pipeline options (empty defaults keep Tier-1, stripes-only, ON).
+
+    Args:
+        config: dict-like of pipeline options (``edge_bias_*`` keys).
+        extraction_path: directory the QA CSV / default flat-mask dir hang off.
+        flat_field_dir: directory holding ``unillum_mask.fits`` (Tier 2), if any.
+
+    Returns:
+        dict: edge-bias settings for ``edge_bias=`` on the extraction path.
+    """
+    config = config or {}
+    return {
+        'enabled':       bool(config.get('edge_bias_dc_correction', True)),
+        'min_distance':  float(config.get('edge_bias_min_distance', 20)),
+        'min_pixels':    int(config.get('edge_bias_min_pixels', 500)),
+        'use_flat_mask': bool(config.get('edge_bias_use_flat_mask', False)),
+        'flat_frac':     float(config.get('edge_bias_flat_frac', 0.1)),
+        'flat_mask_dir': flat_field_dir or os.path.join(extraction_path, 'flat'),
+        'qa_csv':        os.path.join(extraction_path, 'edge_bias_levels.csv'),
+    }
+
+
 def run_extraction(science_file, output_dir, slow_bias=None, fast_bias=None,
                    trace_dir=None, mastercalib_trace_dir=None,
-                   remove_cosmic_rays=True, mask_output_dir=None, method='optimal'):
+                   remove_cosmic_rays=True, mask_output_dir=None, method='optimal',
+                   edge_bias=None):
     """
     Run spectrum extraction with hybrid trace support.
 
@@ -406,12 +434,18 @@ def run_extraction(science_file, output_dir, slow_bias=None, fast_bias=None,
         remove_cosmic_rays: Enable L.A.Cosmic cosmic ray removal before extraction
         mask_output_dir: Output directory for cosmic ray mask FITS files
         method: Extraction method, 'optimal' (default) or 'boxcar' (quick look).
+        edge_bias: Per-frame edge-bias config dict (see build_edge_bias_config).
+            When None, a default (Tier-1, enabled) config is built from output_dir.
 
     Returns:
         str: Path to extraction file
     """
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
+
+    # Default to the Tier-1 edge-bias correction (unilluminated-stripe DC offset).
+    if edge_bias is None:
+        edge_bias = build_edge_bias_config({}, output_dir)
 
     # Default mastercalib location if not specified
     if mastercalib_trace_dir is None:
@@ -430,11 +464,12 @@ def run_extraction(science_file, output_dir, slow_bias=None, fast_bias=None,
                 trace_dir=trace_dir,
                 mastercalib_trace_dir=mastercalib_trace_dir,
                 remove_cosmic_rays=remove_cosmic_rays,
-                mask_output_dir=mask_output_dir
+                mask_output_dir=mask_output_dir,
+                edge_bias=edge_bias
             )
     else:
         assert os.path.exists(science_file), "Science file does not exist."
-        extraction_file_path, _ = ge.GUI_extract(
+        result = ge.GUI_extract(
             science_file,
             output_dir=output_dir,
             slow_bias=slow_bias,
@@ -443,8 +478,14 @@ def run_extraction(science_file, output_dir, slow_bias=None, fast_bias=None,
             trace_dir=trace_dir,
             mastercalib_trace_dir=mastercalib_trace_dir,
             remove_cosmic_rays=remove_cosmic_rays,
-            mask_output_dir=mask_output_dir
+            mask_output_dir=mask_output_dir,
+            edge_bias=edge_bias
         )
+        # GUI_extract now raises on failure; guard against an unexpected None so
+        # a bad return surfaces as a clear error rather than a tuple-unpack crash.
+        if not result:
+            raise RuntimeError("GUI_extract returned no extraction (see log above)")
+        extraction_file_path, _ = result
 
     # GUI_extract returns just the basename; make it a full path
     if extraction_file_path and not os.path.isabs(extraction_file_path):
@@ -483,9 +524,13 @@ def correct_wavelengths(science_extraction_file, soln=None):
     # TODO: when arc processing pipeline is wired up, use soln to generate/load a custom arc solution
     global _cached_reference_arc
     if _cached_reference_arc is None:
-        logger.info("Loading reference arc (first call, will be cached)")
-        _cached_reference_arc = ExtractLlamas.loadExtraction(
-            os.path.join(LUT_DIR, 'LLAMAS_reference_arc.pkl'))
+        arc_path = resolve_reference_arc()
+        if not arc_path:
+            raise FileNotFoundError(
+                "Reference arc 'LLAMAS_reference_arc.pkl' not found in the local "
+                "LUT dir or an installed llamas-pyjamas LUT dir.")
+        logger.info("Loading reference arc (first call, will be cached): %s", arc_path)
+        _cached_reference_arc = ExtractLlamas.loadExtraction(arc_path)
     arcdict = _cached_reference_arc
 
     _science = ExtractLlamas.loadExtraction(science_extraction_file)

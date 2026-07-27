@@ -28,11 +28,26 @@ from PySide6.QtWidgets import (
 from llamas_ql.QLook.core import theme
 from llamas_ql.QLook.core.session import Selection, SelectionKind, Session
 from llamas_ql.QLook.models.fiber_geometry import FiberGeometry
+from llamas_ql.QLook.models.whitelight_model import WhiteLightData
+from llamas_ql.QLook.widgets import hex_view
 from llamas_ql.QLook.widgets._overlays import (
     LLAMAS_FOV_ARCSEC,
     add_compass,
     add_scale_bar,
 )
+from llamas_ql.QLook.widgets.cube_viewer import CubeViewer
+
+#: Spaxel pitch (arcsec) used to convert the LUT's spaxel-index fibre positions
+#: to on-sky arcsec (matches WhiteLightModule.plot_spaxelmap's SPAXEL_PITCH).
+SPAXEL_PITCH_ARCSEC = 0.75
+
+#: Scatter marker size (arcsec) that makes the pointy-top hexagons tile the IFU.
+HEX_SCATTER_SIZE = hex_view.hex_scatter_size(SPAXEL_PITCH_ARCSEC)
+
+#: A click farther than this (LUT units) from the nearest fibre centre is ignored
+#: — so clicking the dark margin doesn't select a random edge fibre.  One hexagon
+#: circumradius is 1/sqrt(3) ≈ 0.577 LUT units; allow a touch more.
+_CLICK_MAX_DIST_LUT = 0.75
 
 
 def _seg_button(text: str) -> QPushButton:
@@ -46,6 +61,7 @@ def _seg_button(text: str) -> QPushButton:
 class DisplayPanel(QWidget):
     channel_changed = Signal(str)   # 'blue' | 'green' | 'red'
     reduce_clicked = Signal(str)    # path (from the centre 'Reduce frame' CTA)
+    hover_fiber = Signal(object)    # int RSS row under the cursor, or None
 
     def __init__(self, session: Session, parent: QWidget | None = None):
         super().__init__(parent)
@@ -60,6 +76,12 @@ class DisplayPanel(QWidget):
         self._pending_path: str | None = None
         self._stretch = "linear"
         self._clip = (1.0, 99.0)   # (lo, hi) percentiles for the scale limits
+        # Mapping used to convert clicked arcsec coords back to fibre-map units.
+        self._geom_center = (0.0, 0.0)   # centroid of spaxel-index positions
+        self._pitch = SPAXEL_PITCH_ARCSEC
+        self._fit_pending = False        # auto-fit the view once per new geometry
+        self._interactive = False        # clicks pick fibres only once the RSS is in
+        self._wl_path: str | None = None  # fast white-light FITS shown pre-RSS
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -68,6 +90,7 @@ class DisplayPanel(QWidget):
         root.addWidget(self._build_body(), 1)
 
         self.session.rss_loaded.connect(self._on_rss)
+        self.session.cube_loaded.connect(self._on_cube_loaded)
 
     # -- toolbar -------------------------------------------------------------
 
@@ -148,6 +171,15 @@ class DisplayPanel(QWidget):
         self._cmap.currentTextChanged.connect(self._set_colormap)
         cl.addWidget(self._cmap)
 
+        # Cube toggle: switches between the fibre map and the cube view; enabled
+        # only once a cube has been built (the last, optional quick-look product).
+        self._cube_btn = QPushButton("Cube")
+        self._cube_btn.setCheckable(True)
+        self._cube_btn.setEnabled(False)
+        self._cube_btn.setCursor(Qt.PointingHandCursor)
+        self._cube_btn.toggled.connect(self._toggle_cube_view)
+        cl.addWidget(self._cube_btn)
+
         lay.addWidget(self._controls)
         self._controls.setVisible(False)
         self._style_segments()
@@ -175,7 +207,9 @@ class DisplayPanel(QWidget):
         self._page_ready = self._make_ready_page()
         self._page_reducing = self._make_reducing_page()
         self._plot = self._make_plot()
-        for w in (self._page_empty, self._page_ready, self._page_reducing, self._plot):
+        self._cube_viewer = CubeViewer(self.session, self)  # shown via the Cube toggle
+        for w in (self._page_empty, self._page_ready, self._page_reducing,
+                  self._plot, self._cube_viewer):
             self._stack.addWidget(w)
         self._stack.setCurrentWidget(self._page_empty)
         stage.addWidget(self._stack, 1)
@@ -198,11 +232,19 @@ class DisplayPanel(QWidget):
         vb.setAspectLocked(True)
         half = LLAMAS_FOV_ARCSEC / 2.0
         vb.setRange(xRange=(-half, half), yRange=(-half, half), padding=0.02)
-        self._scatter = pg.ScatterPlotItem(size=9, pen=None)
+        # Hexagonal fibre markers sized in arcsec (pxMode=False) so they tile the
+        # IFU like the real fibre map and scale with zoom.  hoverable outlines the
+        # hexagon under the cursor once the map is interactive (post-RSS).
+        self._scatter = pg.ScatterPlotItem(
+            symbol=hex_view.hexagon_symbol(), size=HEX_SCATTER_SIZE, pen=None,
+            pxMode=False, hoverable=True,
+            hoverPen=pg.mkPen("#ffffff", width=1.5))
         plot.addItem(self._scatter)
+        self._scatter.sigHovered.connect(self._on_hover)
         add_scale_bar(vb, size=10.0)
         add_compass(vb)
         plot.scene().sigMouseClicked.connect(self._on_canvas_click)
+        self._plot_widget = plot
         self._vb = vb
         return plot
 
@@ -364,8 +406,15 @@ class DisplayPanel(QWidget):
 
     # -- public API ----------------------------------------------------------
 
+    def _reset_interactive(self) -> None:
+        """Leave the interactive fibre map: a new frame/reduction is starting."""
+        self._interactive = False
+        self._wl_path = None
+        self._plot_widget.unsetCursor()
+
     def show_ready(self, item) -> None:
         """Show the ready-to-reduce overlay for a selected science frame."""
+        self._reset_interactive()
         self._pending_path = item.path
         self._ready_name.setText(item.filename)
         self._title.setText(item.filename)
@@ -375,6 +424,7 @@ class DisplayPanel(QWidget):
 
     def show_not_reduced(self, item) -> None:
         """A non-science frame is selected: nothing to display."""
+        self._reset_interactive()
         self._pending_path = None
         self._title.setText(item.filename)
         self._subtitle.setText(f"marked {item.ftype}")
@@ -382,6 +432,7 @@ class DisplayPanel(QWidget):
         self._stack.setCurrentWidget(self._page_empty)
 
     def show_empty(self) -> None:
+        self._reset_interactive()
         self._pending_path = None
         self._title.setText("No frame loaded")
         self._subtitle.setText("—")
@@ -389,6 +440,7 @@ class DisplayPanel(QWidget):
         self._stack.setCurrentWidget(self._page_empty)
 
     def show_reducing(self, item) -> None:
+        self._reset_interactive()
         self._title.setText(item.filename)
         self._subtitle.setText("reducing…")
         self._controls.setVisible(False)
@@ -397,22 +449,59 @@ class DisplayPanel(QWidget):
     def current_channel(self) -> str:
         return self._channel
 
+    def show_whitelight_image(self, path) -> None:
+        """Paint the fast quick-look white-light as discrete per-fibre hexagons.
+
+        Reads the exact per-fibre positions/fluxes from the ``<CH>_TAB`` table for
+        the current channel (no interpolation).  Non-interactive: clicks only pick
+        fibres once the RSS lands and ``_on_rss`` switches the view to interactive.
+        """
+        if not path:
+            return
+        self._wl_path = str(path)
+        if not self._paint_whitelight():
+            return
+        self._controls.setVisible(True)
+        # Don't clobber the interactive fibre map once it is up.
+        if not self._interactive:
+            self._stack.setCurrentWidget(self._plot)
+
+    def _paint_whitelight(self) -> bool:
+        """(Re)paint the pre-RSS white-light hexagons for the current channel."""
+        if not self._wl_path or self._interactive:
+            return False
+        try:
+            wl = WhiteLightData(self._wl_path, channel=self._channel)
+        except Exception:
+            return False  # best-effort first paint; the RSS view follows shortly
+        if not wl.has_fibers:
+            return False
+        self._fit_pending = True
+        self._paint(wl.x, wl.y, wl.flux)
+        self._title.setText(f"white-light · {wl.channel}")
+        self._subtitle.setText("white-light · extracting spectra…")
+        return True
+
     # -- session reaction ----------------------------------------------------
 
     def _on_rss(self, rss) -> None:
         if rss is None or getattr(rss, "fibermap", None) is None:
             self._geom = None
+            self._interactive = False
             self._scatter.clear()
             return
         self._geom = FiberGeometry(rss)
+        self._interactive = True   # extracted spectra are in: clicks now pick fibres
+        self._plot_widget.setCursor(Qt.PointingHandCursor)
         ch = str(getattr(rss, "channel", "green")).lower()
         if ch in self._chan_buttons:
             self._channel = ch
             self._chan_buttons[ch].setChecked(True)
             self._update_wave_chip(self._wave_slider.value())
         self._title.setText(getattr(rss, "primary_header", {}).get("OBJECT", "RSS") if getattr(rss, "primary_header", None) else "RSS")
-        self._subtitle.setText(f"RGB cube · {ch}")
+        self._subtitle.setText(f"hex white-light · {ch} · click a fibre for its spectrum")
         self._controls.setVisible(True)
+        self._fit_pending = True   # new geometry: fit the view to its extent once
         self._render()
         self._stack.setCurrentWidget(self._plot)
 
@@ -424,17 +513,40 @@ class DisplayPanel(QWidget):
             flux = self._geom.whitelight_flux(center - 50.0, center + 50.0)
         else:
             flux = self._geom.whitelight_flux()
-        valid = self._geom.valid
-        x = self._geom.x[valid]
-        y = self._geom.y[valid]
-        f = flux[valid]
-        rows = np.nonzero(valid)[0]
-        brushes = self._colors(f)
-        spots = [
-            {"pos": (x[i], y[i]), "data": int(rows[i]), "brush": brushes[i]}
-            for i in range(len(rows))
-        ]
+        self._paint(self._geom.x, self._geom.y, flux, valid=self._geom.valid)
+
+    def _paint(self, gx, gy, flux, valid=None) -> None:
+        """Draw one hexagon per fibre from LUT-unit positions and per-fibre flux.
+
+        Applies the shared N-up/E-left rotation + pitch-scaling (:mod:`hex_view`)
+        and stores the LUT-unit centroid for the click-picking inverse.  Used by
+        both the pre-RSS white-light and the post-RSS interactive fibre map.
+        """
+        gx = np.asarray(gx, dtype=float)
+        gy = np.asarray(gy, dtype=float)
+        flux = np.asarray(flux, dtype=float)
+        fin = np.isfinite(gx) & np.isfinite(gy)
+        if valid is not None:
+            fin &= np.asarray(valid, dtype=bool)
+        if not fin.any():
+            self._scatter.clear()
+            return
+        cx = float(np.mean(gx[fin]))
+        cy = float(np.mean(gy[fin]))
+        self._geom_center = (cx, cy)
+        center = (cx, cy)
+        brushes = self._colors(flux[fin])
+        rows = np.nonzero(fin)[0]
+        spots = hex_view.build_spots(gx[fin], gy[fin], brushes, rows, center, self._pitch)
         self._scatter.setData(spots)
+        if self._fit_pending and len(rows):
+            self._fit_pending = False
+            dx, dy = hex_view.to_display(gx[fin], gy[fin], center, self._pitch)
+            pad = self._pitch
+            self._vb.setRange(
+                xRange=(float(dx.min()) - pad, float(dx.max()) + pad),
+                yRange=(float(dy.min()) - pad, float(dy.max()) + pad),
+                padding=0.02)
 
     def _colors(self, values: np.ndarray):
         v = np.asarray(values, dtype=float)
@@ -458,15 +570,38 @@ class DisplayPanel(QWidget):
         return [pg.mkBrush(*lut[i]) for i in idx]
 
     def _on_canvas_click(self, event) -> None:
-        if self._geom is None:
+        if self._geom is None or not self._interactive:
             return
         pt = self._vb.mapSceneToView(event.scenePos())
-        row = self._geom.nearest_fiber(pt.x(), pt.y())
-        if row is None:
+        # Invert the display mapping (rotation + pitch) back to fibre-map units.
+        sx, sy = hex_view.to_lut(pt.x(), pt.y(), self._geom_center, self._pitch)
+        row = self._geom.nearest_fiber(sx, sy)
+        if row is None or not self._within_hex(row, sx, sy):
             return
         self.session.set_selection(
             Selection(kind=SelectionKind.FIBER, fiber_index=row, label=f"fiber {row}")
         )
+
+    def _within_hex(self, row: int, sx: float, sy: float) -> bool:
+        """True if fibre ``row``'s centre is within one hexagon of ``(sx, sy)`` (LUT units)."""
+        try:
+            fx = float(self._geom.x[row])
+            fy = float(self._geom.y[row])
+        except (IndexError, TypeError):
+            return True  # can't check (e.g. a test stub): don't block the pick
+        return (fx - sx) ** 2 + (fy - sy) ** 2 <= _CLICK_MAX_DIST_LUT ** 2
+
+    def _on_hover(self, *args) -> None:
+        """Emit the RSS row under the cursor (interactive only) for the status bar."""
+        if not self._interactive:
+            return
+        points = args[1] if len(args) > 1 else (args[0] if args else None)
+        row = None
+        if points is not None and len(points):
+            data = points[0].data()
+            if data is not None:
+                row = int(data)
+        self.hover_fiber.emit(row)
 
     # -- control handlers ----------------------------------------------------
 
@@ -490,10 +625,21 @@ class DisplayPanel(QWidget):
             self._vb.addItem(mid)
             self._grid_items.append(mid)
 
+    def _on_cube_loaded(self, cube) -> None:
+        """Enable the Cube toggle once a cube is available (don't steal focus)."""
+        self._cube_btn.setEnabled(cube is not None)
+
+    def _toggle_cube_view(self, on: bool) -> None:
+        self._stack.setCurrentWidget(self._cube_viewer if on else self._plot)
+
     def _set_channel(self, ch: str) -> None:
         self._channel = ch
         self._update_wave_chip(self._wave_slider.value())
         self._style_segments()
+        # Pre-RSS, the fast white-light is per-channel: repaint from the new
+        # channel's table so B/G/R actually changes the image.
+        if not self._interactive:
+            self._paint_whitelight()
         self.channel_changed.emit(ch)
 
     def _set_colormap(self, name: str) -> None:

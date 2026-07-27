@@ -166,54 +166,42 @@ class ExtractLlamas:
                 logger.warning(f"Error accessing dead fibers in LUT: {e}")
 
 
+            naxis1 = self.trace.naxis1
+            naxis2 = self.trace.naxis2
             for ifiber in range(trace.nfibers):
-                extracted = np.zeros(self.trace.naxis1)
-                # print fiber, and list of dead fibers, print also bench and color
-                logger.info(self.dead_fibers)
-                logger.info(f'Extracting fiber # {ifiber} of {trace.nfibers} for bench {benchside} channel {self.channel}')
+                # Per-fibre logging is intentionally at DEBUG: at INFO it emits
+                # ~nfibers×24 events per reduce, flooding the GUI log and slowing
+                # the "quick look" it is meant to serve.
                 if ifiber in self.dead_fibers:
-                    logger.info(f"Skipping dead fiber # {ifiber}")
-                    self.counts[ifiber,:] = extracted
+                    logger.debug(f"Skipping dead fiber # {ifiber}")
+                    self.counts[ifiber, :] = 0.0
                     continue
+                logger.debug(f'Extracting fiber # {ifiber} of {trace.nfibers} '
+                             f'for bench {benchside} channel {self.channel}')
 
-                if (optimal == True):
-                    # Optimally weighted extraction (a la Horne et al ~1986)
-                    #logger.info("..Optimally Extracting fiber #{}".format(ifiber))
-                    x_spec,f_spec,weights = self.isolateProfile(ifiber)
+                if optimal:
+                    # Optimally weighted extraction (a la Horne et al ~1986).
+                    x_spec, f_spec, weights = self.isolateProfile(ifiber)
                     if x_spec is None:
                         continue
-                
-                    extracted = np.zeros(self.trace.naxis1)
-                    for i in range(self.trace.naxis1):
-                        thisx = (x_spec == i)
-                        if np.nansum(thisx) > 0:
-                            extracted[i] = np.nansum(f_spec[thisx]*weights[thisx])/np.nansum(weights[thisx])
-                        #handles case where there are no elements
-                        else:
-                            extracted[i] = 0.0
+                    self.counts[ifiber, :] = self._optimal_extract_column(
+                        x_spec, f_spec, weights, naxis1)
 
-                    self.counts[ifiber,:] = extracted
-                
-                elif optimal == False:
-                    # Boxcar Extraction - fast!
-                    logger.info("..Boxcar extracting fiber #{}".format(ifiber))
-                    x_spec,f_spec,weights = self.isolateProfile(ifiber, boxcar=True)
-                    
+                else:
+                    # Boxcar extraction: sum a fixed 9-row window centred on the
+                    # trace at each column. Vectorised gather; matches the old
+                    # per-column ``frame[y-4:y+5, i]`` sum for interior fibres and
+                    # clips (rather than numpy-wraps) the window at the detector edge.
+                    x_spec, f_spec, weights = self.isolateProfile(ifiber, boxcar=True)
                     if x_spec is None:
                         continue
-                
-                    extracted = np.zeros(self.trace.naxis1)
-                    tracey = self.trace.traces[ifiber,:]
-                    for i in range(self.trace.naxis1):
-                        thisx = (x_spec == i)   
-                        if np.nansum(thisx) > 0:
-                            extracted[i] = np.nansum(f_spec[thisx])
-                        #handles case where there are no elements
-                        else:
-                            extracted[i] = 0.0
-                        extracted[i] = np.nansum(self.frame[round(tracey[i])-4:round(tracey[i])+5,i])
-
-                    self.counts[ifiber,:] = extracted
+                    cols = np.arange(naxis1)
+                    centers = np.rint(self.trace.traces[ifiber, :]).astype(int)
+                    rows = centers[None, :] + np.arange(-4, 5)[:, None]   # (9, naxis1)
+                    valid = (rows >= 0) & (rows < naxis2)
+                    vals = self.frame[np.clip(rows, 0, naxis2 - 1), cols[None, :]]
+                    extracted = np.nansum(np.where(valid, vals, np.nan), axis=0)
+                    self.counts[ifiber, :] = extracted
             self.old_count_shape = self.counts.shape
             logger.info(f'Benchside {benchside} counts shape {self.counts.shape}')
             # Process the dead fibers by inserting dummy arrays at specific indices
@@ -332,6 +320,34 @@ class ExtractLlamas:
             weights = self.trace.profimg[inprofile]#self.trace.profimg[inprofile]
         
         return x_spec,f_spec,weights
+
+    @staticmethod
+    def _optimal_extract_column(x_spec, f_spec, weights, naxis1):
+        """Vectorised Horne-style optimal extraction: per-column weighted mean.
+
+        Groups the profile pixels of one fibre by their integer column index and
+        returns ``sum(f*w)/sum(w)`` per column (0 where a column has no pixels).
+
+        This replaces the previous per-column Python scan (``x_spec == i`` over
+        every profile pixel, repeated for all ~2048 columns), which dominated
+        reduction time. It is numerically identical to that loop, including its
+        ``nansum`` semantics: a NaN-flux pixel drops out of the numerator, but its
+        (finite) weight still contributes to the denominator.
+        """
+        xs = np.rint(np.asarray(x_spec, dtype=float))
+        in_range = np.isfinite(xs) & (xs >= 0) & (xs < naxis1)
+        xs = xs[in_range].astype(np.intp)
+        f = np.asarray(f_spec, dtype=float)[in_range]
+        w = np.asarray(weights, dtype=float)[in_range]
+        fw = f * w
+        num = np.bincount(xs, weights=np.where(np.isnan(fw), 0.0, fw), minlength=naxis1)
+        den = np.bincount(xs, weights=np.where(np.isnan(w), 0.0, w), minlength=naxis1)
+        count = np.bincount(xs, minlength=naxis1)
+        extracted = np.zeros(naxis1)
+        nonempty = count > 0
+        with np.errstate(divide='ignore', invalid='ignore'):
+            extracted[nonempty] = num[nonempty] / den[nonempty]
+        return extracted
 
 
     # Set to False to include full 2D detector images in pickled files (for QA/troubleshooting).

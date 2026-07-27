@@ -16,9 +16,15 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import time
 import traceback
+
+# Headless worker: force a non-interactive matplotlib backend before any backend
+# module (e.g. Arc/arcLlamasMulti) can import pyplot, so a stray ``plt.show()``
+# can never block the reduction process forever.
+os.environ.setdefault("MPLBACKEND", "Agg")
 
 from llamas_ql.QLook.workers import protocol
 from llamas_ql.QLook.workers.protocol import JobSpec
@@ -41,6 +47,10 @@ class _Emitter:
 
     def log(self, level, msg, name=""):
         protocol.emit_log(self.stream, level, msg, name, job_id=self.job_id)
+
+    def partial(self, payload):
+        """Publish a non-terminal intermediate artefact (job stays open)."""
+        protocol.emit_partial(self.stream, payload, job_id=self.job_id)
 
     def result(self, payload):
         protocol.emit_result(self.stream, payload, job_id=self.job_id)
@@ -78,17 +88,21 @@ def _install_log_bridge(out) -> NDJSONLogHandler:
 
 
 def _extract_to_rss(science, output_dir, trace_dir, em: _Emitter, *,
-                    method="optimal", remove_crs=True) -> dict:
+                    method="optimal", remove_crs=True, apply_wavelength=True,
+                    edge_bias=None) -> dict:
     """Shared extract → (reference-arc) wavelength → per-channel RSS path.
 
     Used by the cube ``reduce`` flow (optimal) and ``extract_only`` (boxcar, no
     CR). Wavelength calibration is skipped gracefully when the reference arc is
-    not deployed (products then carry a pixel-index axis).
+    not deployed (products then carry a pixel-index axis). ``apply_wavelength``
+    False force-skips it even when the arc is present — the fast ``quicklook``
+    path uses this to avoid loading the ~4.5 GB reference arc, showing per-fibre
+    spectra on a pixel-index axis first.
     """
     import os
 
     from llamas_ql import reduce
-    from llamas_ql.config import CALIB_DIR, LUT_DIR
+    from llamas_ql.config import CALIB_DIR, LUT_DIR, resolve_reference_arc
     from llamas_ql.Extract.extractLlamas import save_extractions
     from llamas_ql.File.llamasRSS import RSSgeneration
 
@@ -107,17 +121,17 @@ def _extract_to_rss(science, output_dir, trace_dir, em: _Emitter, *,
     em.stage("extract", _START)
     extract_pkl = reduce.run_extraction(
         science, output_dir, trace_dir=trace_dir, mastercalib_trace_dir=CALIB_DIR,
-        remove_cosmic_rays=remove_crs, method=method,
+        remove_cosmic_rays=remove_crs, method=method, edge_bias=edge_bias,
     )
     if not extract_pkl or not os.path.exists(extract_pkl):
         raise RuntimeError("extraction produced no output")
     em.stage("extract", _DONE)
 
     em.stage("wavelength", _START)
-    arc_path = os.path.join(LUT_DIR, "LLAMAS_reference_arc.pkl")
+    arc_path = resolve_reference_arc()
     rss_input_pkl = extract_pkl
     wavelength_applied = False
-    if os.path.exists(arc_path):
+    if apply_wavelength and arc_path and os.path.exists(arc_path):
         corr_extr, primary_hdr = reduce.correct_wavelengths(extract_pkl)
         base = os.path.splitext(os.path.basename(extract_pkl))[0]
         corr_pkl = os.path.join(output_dir, f"{base}_corrected_extractions.pkl")
@@ -129,6 +143,10 @@ def _extract_to_rss(science, output_dir, trace_dir, em: _Emitter, *,
         rss_input_pkl = corr_pkl
         wavelength_applied = True
         em.stage("wavelength", _DONE)
+    elif not apply_wavelength:
+        logger.info("quick look: skipping wavelength calibration for speed "
+                    "(products use a pixel-index axis).")
+        em.stage("wavelength", _SKIP)
     else:
         logger.warning(
             "Reference arc not found at %s; skipping wavelength calibration "
@@ -153,17 +171,44 @@ def _extract_to_rss(science, output_dir, trace_dir, em: _Emitter, *,
 
 def _resolve_io(job: JobSpec):
     """Common (science, output_dir, options, trace_dir) resolution for science jobs."""
-    import os
-
-    from llamas_ql.config import CALIB_DIR
+    from llamas_ql.config import OUTPUT_DIR
 
     if not job.inputs:
         raise ValueError(f"{job.kind} job requires a science file in inputs[0]")
     science = job.inputs[0]
-    output_dir = job.output_dir or CALIB_DIR
+    # Products go to a writable output dir; never default to the (now possibly
+    # read-only, pyjamas-resolved) master calibration directory.
+    output_dir = job.output_dir or OUTPUT_DIR
     os.makedirs(output_dir, exist_ok=True)
     opts = job.options or {}
     return science, output_dir, opts, opts.get("trace_dir")
+
+
+def _require_master_calibs(trace_dir=None) -> str:
+    """Preflight: ensure trace calibrations are resolvable before heavy work.
+
+    Returns the master-calibration directory. Raises a clear, actionable error
+    (surfaced as an ``error`` event by :func:`_dispatch`) when neither nightly
+    traces nor any master library (local packaged dir or an installed
+    llamas-pyjamas) can be found — instead of failing opaquely deep inside Ray.
+    """
+    from llamas_ql.config import (resolve_master_calib_dir, pyjamas_pkg_dir,
+                                  _LOCAL_CALIB_DIR)
+
+    master = resolve_master_calib_dir()
+    if master:
+        return master
+    # A non-empty nightly trace dir is itself sufficient to extract against.
+    if trace_dir and os.path.isdir(trace_dir) and os.listdir(trace_dir):
+        return trace_dir
+    searched = [_LOCAL_CALIB_DIR]
+    pj = pyjamas_pkg_dir()
+    searched.append(os.path.join(pj, "mastercalib") if pj
+                    else "(llamas-pyjamas not installed on sys.path)")
+    raise RuntimeError(
+        "No master calibrations found. Run 'Process Cals' to generate nightly "
+        "traces for tonight, or deploy the master trace pickles. Searched: "
+        + "; ".join(searched))
 
 
 # --- job handlers -----------------------------------------------------------
@@ -187,6 +232,7 @@ def _run_dummy(job: JobSpec, em: _Emitter) -> dict:
 def _run_reduce(job: JobSpec, em: _Emitter) -> dict:
     """Science quick reduction → per-channel RSS (optimal extraction, for cubes)."""
     science, output_dir, opts, trace_dir = _resolve_io(job)
+    _require_master_calibs(trace_dir)
     from llamas_ql import reduce
 
     em.progress(0, "validate")
@@ -200,6 +246,7 @@ def _run_reduce(job: JobSpec, em: _Emitter) -> dict:
         science, output_dir, trace_dir, em,
         method=opts.get("extraction_method", "optimal"),
         remove_crs=bool(opts.get("remove_cosmic_rays", True)),
+        edge_bias=reduce.build_edge_bias_config(opts, output_dir),
     )
     em.progress(100, "rss")
     return payload
@@ -208,6 +255,7 @@ def _run_reduce(job: JobSpec, em: _Emitter) -> dict:
 def _run_extract_only(job: JobSpec, em: _Emitter) -> dict:
     """Boxcar extraction → per-channel RSS (no flat-field, CR, sky, or cube)."""
     science, output_dir, opts, trace_dir = _resolve_io(job)
+    _require_master_calibs(trace_dir)
     from llamas_ql import reduce
 
     em.progress(0, "validate")
@@ -217,9 +265,127 @@ def _run_extract_only(job: JobSpec, em: _Emitter) -> dict:
 
     em.progress(25, "extract")
     payload = _extract_to_rss(
-        science, output_dir, trace_dir, em, method="boxcar", remove_crs=False)
+        science, output_dir, trace_dir, em, method="boxcar", remove_crs=False,
+        edge_bias=reduce.build_edge_bias_config(opts, output_dir))
     payload["mode"] = "extract_only"
     em.progress(100, "rss")
+    return payload
+
+
+def _pick_channel_rss(rss_files, channel):
+    """Pick the RSS file for ``channel`` (matches ``_<channel>`` in the basename),
+    falling back to the first file."""
+    if not rss_files:
+        return None
+    if channel:
+        for f in rss_files:
+            if f"_{channel.lower()}" in os.path.basename(f).lower():
+                return f
+    return rss_files[0]
+
+
+def _quick_whitelight(science, output_dir, opts, trace_dir) -> str:
+    """Fast trace-based white-light image off the MEF (no optimal extraction)."""
+    from llamas_ql.Image.WhiteLightModule import QuickWhiteLightCube
+    from llamas_ql.QLook.workers.qa import resolve_bias
+
+    try:
+        _mode, master = resolve_bias(science, opts.get("slow_bias"), opts.get("fast_bias"))
+    except Exception:  # unreadable frame/master — let QuickWhiteLight auto-select
+        master = None
+    out_path = opts.get("whitelight_output") or os.path.join(
+        output_dir, os.path.splitext(os.path.basename(science))[0] + "_wlc.fits")
+    result = QuickWhiteLightCube(science, bias=master, outfile=out_path, use_dir=trace_dir)
+    out_path = result or out_path
+    if not out_path or not os.path.exists(out_path):
+        raise RuntimeError(f"white-light output was not created: {out_path}")
+    return out_path
+
+
+def _build_cube(rss, opts) -> str:
+    """Build a Simple Cube from one RSS file (fast nearest_hex grid by default)."""
+    from llamas_ql.Cube.simple_cube_constructor import SimpleCubeConstructor
+
+    grid_method = opts.get("grid_method", "nearest_hex")
+    out_path = opts.get("cube_output") or (os.path.splitext(rss)[0] + "_cube.fits")
+    constructor = SimpleCubeConstructor(grid_method=grid_method)
+    constructor.load_rss_file(rss)
+    constructor.match_fibers_to_fibermap()
+    constructor.create_wavelength_grid()
+    constructor.create_spatial_grid()
+    constructor.construct_cube()
+    try:
+        constructor.create_wcs()
+    except Exception:
+        pass
+    constructor.save_cube(out_path, overwrite=True)
+    return out_path
+
+
+def _run_quicklook(job: JobSpec, em: _Emitter) -> dict:
+    """Progressive quick look (the default Reduce action).
+
+    Streams products as they become ready so observers get information fast:
+      1. a trace-based **white-light image** (no optimal extraction) → shown ASAP;
+      2. **boxcar per-fibre spectra** (CR off, pixel-index axis — the 4.5 GB arc
+         is skipped for speed) → the hex fibre map becomes clickable;
+      3. a **simple cube** (nearest_hex), best-effort — a slow/failed cube never
+         drops the white-light or spectra already displayed.
+    A single terminal ``result`` carries the full product manifest.
+    """
+    logger = logging.getLogger("llamas_ql.QLook.quicklook")
+    science, output_dir, opts, trace_dir = _resolve_io(job)
+    _require_master_calibs(trace_dir)
+    from llamas_ql import reduce
+
+    channel = opts.get("inspect_channel", "green")
+    payload = {"science": science, "mode": "quicklook"}
+
+    em.progress(0, "validate")
+    em.stage("validate", _START)
+    reduce.validate_input_files([science])
+    em.stage("validate", _DONE)
+    em.stage("flatfield", _SKIP)
+
+    # 1) White-light image ASAP.
+    em.progress(10, "whitelight")
+    em.stage("whitelight", _START)
+    try:
+        wl_path = _quick_whitelight(science, output_dir, opts, trace_dir)
+        payload["whitelight"] = wl_path
+        em.partial({"kind": "whitelight", "path": wl_path, "science": science})
+        em.stage("whitelight", _DONE)
+    except Exception as exc:
+        logger.exception("white-light step failed")
+        em.log("WARNING", f"white-light image failed: {exc}")
+        em.stage("whitelight", _SKIP)
+
+    # 2) Boxcar per-fibre spectra (fast: CR off, pixel-index axis).
+    em.progress(40, "extract")
+    rss = _extract_to_rss(science, output_dir, trace_dir, em,
+                          method="boxcar", remove_crs=False, apply_wavelength=False,
+                          edge_bias=reduce.build_edge_bias_config(opts, output_dir))
+    payload.update(rss)
+    em.partial({"kind": "rss", "rss_files": rss["rss_files"],
+                "channel": channel, "science": science})
+
+    # 3) Simple cube (best-effort).
+    rss_for_cube = _pick_channel_rss(rss["rss_files"], channel)
+    if rss_for_cube:
+        em.progress(80, "cube")
+        em.stage("cube", _START)
+        try:
+            cube_path = _build_cube(rss_for_cube, opts)
+            payload["cube"] = cube_path
+            em.partial({"kind": "cube", "path": cube_path, "science": science})
+            em.stage("cube", _DONE)
+        except Exception as exc:
+            logger.exception("cube step failed")
+            em.log("WARNING", f"cube build failed (white-light + spectra still "
+                              f"available): {exc}")
+            em.stage("cube", _SKIP)
+
+    em.progress(100, "cube")
     return payload
 
 
@@ -359,6 +525,7 @@ def _run_cube(job: JobSpec, em: _Emitter) -> dict:
 
 _HANDLERS = {
     "dummy": _run_dummy,
+    "quicklook": _run_quicklook,
     "reduce": _run_reduce,
     "extract_only": _run_extract_only,
     "whitelight": _run_whitelight,

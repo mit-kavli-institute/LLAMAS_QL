@@ -10,8 +10,14 @@ Event lines look like::
     {"type": "stage", "stage": "extract", "status": "start"}
     {"type": "log", "level": "INFO", "name": "llamas_ql.Extract", "msg": "..."}
     {"type": "progress", "pct": 42, "stage": "extract"}
+    {"type": "partial", "payload": {"kind": "whitelight", "path": "..."}}
     {"type": "result", "payload": {"rss": "/path/to/RSS.fits"}}
     {"type": "error", "msg": "traceback ..."}
+
+A ``partial`` event is a *non-terminal* intermediate artefact: it lets one job
+publish products as they become ready (e.g. a white-light image before the RSS)
+so the GUI can display them progressively. The job stays open; exactly one
+terminal ``result`` (or ``error``) closes it.
 
 Any stdout line that is *not* valid event JSON is treated by the GUI as a raw
 log line (the backend emits bare ``print()`` and noisy Ray/pypeit output).
@@ -134,6 +140,11 @@ def emit_progress(stream, pct: int, stage: str | None = None,
 def emit_log(stream, level: str, msg: str, name: str = "",
              job_id: str | None = None) -> None:
     _emit(stream, {"type": "log", "level": level, "name": name, "msg": msg}, job_id)
+
+
+def emit_partial(stream, payload: dict[str, Any], job_id: str | None = None) -> None:
+    """Emit a non-terminal intermediate artefact; the job stays open."""
+    _emit(stream, {"type": "partial", "payload": payload}, job_id)
 
 
 def emit_result(stream, payload: dict[str, Any], job_id: str | None = None) -> None:
