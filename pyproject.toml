@@ -1,0 +1,37 @@
+[tool.poetry]
+name = "llamas-ql"
+version = "0.1.0"
+description = "Quick Look reduction engine for the Magellan LLAMAS Integral Field Spectrograph"
+authors = ["LLAMAS team"]
+license = "MIT"
+readme = "README.md"
+packages = [{ include = "llamas_ql" }]
+
+[tool.poetry.dependencies]
+python = ">3.11,<3.13"
+pypeit = ">=1.17.0"
+scipy = ">=1.8.0"
+astropy = ">=6.1.3"
+numpy = "2.2.1"
+ipython = "^8.29.0"
+matplotlib = "^3.9.2"
+ray = "^2.39.0"
+cloudpickle = "^3.1.1"
+setuptools = "^80.9.0"
+lacosmic = "^1.4.0"
+h5py = "^3.11.0"
+psutil = "^6.0.0"
+# GUI frontend deps are optional: `pip install -e .[gui]` (or `poetry install -E gui`).
+# Importing `llamas_ql` stays Qt-free; only `llamas_ql.QLook` needs these.
+PySide6 = { version = ">=6.6", optional = true }
+pyqtgraph = { version = ">=0.13", optional = true }
+
+[tool.poetry.extras]
+gui = ["PySide6", "pyqtgraph"]
+
+[tool.poetry.scripts]
+llamas-ql-gui = "llamas_ql.QLook.app:main"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
